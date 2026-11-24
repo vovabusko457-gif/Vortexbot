@@ -54,7 +54,21 @@ def send_message(chat_id, text, menu=None):
 
     tg_request("sendMessage", data)
 
+def save_history():
+    with open("history.json", "w", encoding="utf-8") as file:
+        json.dump(chat_histories, file, ensure_ascii=False)
 
+
+def load_history():
+    global chat_histories
+    try:
+        with open("history.json", "r", encoding="utf-8") as file:
+            chat_histories = {
+                int(key): value
+                for key, value in json.load(file).items()
+            }
+    except (FileNotFoundError, json.JSONDecodeError):
+        chat_histories = {}
 def ask_ai(chat_id, prompt):
     history = chat_histories.get(chat_id, [])
 
@@ -104,7 +118,7 @@ def ask_ai(chat_id, prompt):
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": answer})
         chat_histories[chat_id] = history[-10:]
-
+save_history()
         return answer.strip()
 
     except urllib.error.HTTPError as error:
@@ -252,7 +266,7 @@ def handle_message(message):
 
 
 offset = 0
-
+load_history()
 while True:
     try:
         updates = tg_request("getUpdates", {
