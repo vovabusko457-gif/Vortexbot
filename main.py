@@ -89,9 +89,10 @@ def ask_ai(chat_id, prompt):
         GROQ_API,
         data=json.dumps(payload).encode(),
         headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_KEY}"
-        }
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {GROQ_KEY}",
+    "User-Agent": "VORTEX/1.0"
+}
     )
 
     try:
