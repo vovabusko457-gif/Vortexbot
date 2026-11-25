@@ -255,7 +255,7 @@ def ask_ai(chat_id, prompt):
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {GROQ_KEY}",
-            "User-Agent": "VORTEX/1.0"
+            "User-Agent": "VORTEX-Bot/1.0"
         }
     )
 
@@ -287,7 +287,7 @@ def ask_ai(chat_id, prompt):
         return "Что-то пошло не так. Попробуй ещё раз."
 
 
-# 🎙️ РАСПОЗНАВАНИЕ ГОЛОСОВЫХ СООБЩЕНИЙ
+# 🎙️ РАСПОЗНАВАНИЕ ГОЛОСОВЫХ
 
 def transcribe_voice(file_id):
     try:
@@ -296,6 +296,7 @@ def transcribe_voice(file_id):
         })
 
         if not file_info.get("ok"):
+            print("Telegram getFile error:", file_info)
             return None
 
         file_path = file_info["result"]["file_path"]
@@ -307,7 +308,12 @@ def transcribe_voice(file_id):
         with urllib.request.urlopen(download_url, timeout=60) as response:
             audio_data = response.read()
 
-        if not audio_data or len(audio_data) > 20 * 1024 * 1024:
+        if not audio_data:
+            print("Empty audio file")
+            return None
+
+        if len(audio_data) > 20 * 1024 * 1024:
+            print("Audio file is too large")
             return None
 
         boundary = "----VORTEX" + uuid.uuid4().hex
@@ -331,7 +337,8 @@ def transcribe_voice(file_id):
             data=body,
             headers={
                 "Authorization": f"Bearer {GROQ_KEY}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}"
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "User-Agent": "VORTEX-Bot/1.0"
             }
         )
 
@@ -339,6 +346,9 @@ def transcribe_voice(file_id):
             result = json.loads(response.read())
 
         recognized = result.get("text", "").strip()
+
+        if not recognized:
+            print("Whisper returned empty transcription")
 
         return recognized if recognized else None
 
@@ -399,16 +409,18 @@ def handle_callback(callback):
 def handle_message(message):
     chat_id = message["chat"]["id"]
     text = message.get("text", "").strip()
+    is_voice = bool(message.get("voice"))
 
     # 🎙️ Обработка голосовых сообщений
-    if message.get("voice"):
+    if is_voice:
         if not can_use_ai(chat_id):
             return
 
         send_message(chat_id, "🎙️ VORTEX слушает тебя...")
 
-        file_id = message["voice"]["file_id"]
-        recognized_text = transcribe_voice(file_id)
+        recognized_text = transcribe_voice(
+            message["voice"]["file_id"]
+        )
 
         if not recognized_text:
             send_message(
@@ -426,9 +438,6 @@ def handle_message(message):
             f"📝 Я услышал:\n\n{text}\n\n⚡ Обрабатываю..."
         )
 
-        # После распознавания голосовое обрабатывается
-        # как обычное сообщение ниже.
-
     if not text:
         return
 
@@ -442,7 +451,7 @@ def handle_message(message):
             "⚡ VORTEX\n\n"
             "Твой ИИ-помощник.\n\n"
             "Создавай посты, придумывай идеи, "
-            "задавай вопросы или просто отправляй голосовые сообщения 🎙️",
+            "задавай вопросы или отправляй голосовые сообщения 🎙️",
             keyboard
         )
         return
@@ -461,7 +470,7 @@ def handle_message(message):
             "• Помощь с текстами\n"
             "• Ответы на вопросы\n"
             "• Разные стили написания\n"
-            "• 🎙️ Распознавание голосовых сообщений",
+            "• 🎙️ Распознавание голосовых",
             keyboard
         )
         return
