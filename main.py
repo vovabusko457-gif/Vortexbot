@@ -39,6 +39,7 @@ CF_EDIT_API = (
 
 MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 PIPER_VOICE = "ru_RU-dmitri-medium"
 PIPER_DIR = os.path.join(os.getcwd(), "piper_voices")
@@ -59,6 +60,7 @@ VOICE_SPEED = "atempo=1.10"
 user_states = {}
 chat_histories = {}
 users = {}
+last_video_transcripts = {}
 
 # =========================
 # RAILWAY PERSISTENT STORAGE
@@ -1398,6 +1400,127 @@ def handle_photo_edit(message):
 
 
 # =========================
+# TELEGRAM VIDEO NOTES (КРУЖКИ)
+# =========================
+
+def transcribe_audio_bytes(audio_data, filename="circle.mp3", content_type="audio/mpeg"):
+    """Распознаёт аудиодорожку из видеокружка через Groq Whisper."""
+    boundary = "----VORTEX" + uuid.uuid4().hex
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="model"\r\n\r\n'
+        f"{WHISPER_MODEL}\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode() + audio_data + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        GROQ_AUDIO_API, data=body,
+        headers={"Authorization": f"Bearer {GROQ_KEY}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"}
+    )
+    with urllib.request.urlopen(req, timeout=120) as response:
+        result = json.loads(response.read())
+    return result.get("text", "").strip()
+
+
+def analyze_video_note(file_id, user_request=""):
+    """Извлекает звук и несколько кадров кружка, затем анализирует их через модели Groq."""
+    video_data = download_telegram_file(file_id)
+    if not video_data or len(video_data) > 20 * 1024 * 1024:
+        raise Exception("Кружок пустой или превышает лимит 20 МБ")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        video_path = os.path.join(temp_dir, "circle.mp4")
+        audio_path = os.path.join(temp_dir, "circle.mp3")
+        with open(video_path, "wb") as f:
+            f.write(video_data)
+
+        subprocess.run([
+            "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1",
+            "-ar", "16000", "-b:a", "48k", audio_path
+        ], check=True, capture_output=True, timeout=90)
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+        spoken_text = transcribe_audio_bytes(audio_data) if audio_data else ""
+
+        # Берём кадры в начале, середине и ближе к концу, чтобы модель видела контекст.
+        frame_paths = []
+        for index, seek in enumerate((0.5, 2.0, 4.0)):
+            frame_path = os.path.join(temp_dir, f"frame_{index}.jpg")
+            result = subprocess.run([
+                "ffmpeg", "-y", "-ss", str(seek), "-i", video_path,
+                "-frames:v", "1", "-vf", "scale='min(640,iw)':-2",
+                "-q:v", "5", frame_path
+            ], capture_output=True, timeout=45)
+            if result.returncode == 0 and os.path.exists(frame_path):
+                frame_paths.append(frame_path)
+
+        content = [{"type": "text", "text": (
+            "Проанализируй видеокружок. Опиши только то, что действительно видно. "
+            "Учитывай распознанную речь и ответь на запрос пользователя. "
+            "Если пользователь просит перевод, переведи распознанную речь полностью, "
+            "сохраняя смысл и тон, без пересказа. Не выдумывай отсутствующие слова.\n"
+            f"Распознанная речь: {spoken_text or 'Речь не распознана.'}\n"
+            f"Запрос пользователя: {user_request or 'Опиши, что происходит в кружке.'}"
+        )}]
+        for frame_path in frame_paths:
+            with open(frame_path, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("ascii")
+            content.append({"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64," + encoded
+            }})
+
+        payload = {
+            "model": VISION_MODEL,
+            "messages": [
+                {"role": "system", "content": (
+                    "Ты VORTEX, спокойный и компетентный персональный ИИ-помощник. "
+                    "Обращайся к пользователю 'сэр' естественно, не в каждом предложении. "
+                    "Отвечай по-русски, если не просят другой язык. "
+                    "Не используй Markdown, хештеги и декоративные символы. "
+                    "Не придумывай детали, которых нет в видео или аудио."
+                )},
+                {"role": "user", "content": content}
+            ],
+            "temperature": 0.2,
+            "max_completion_tokens": 900
+        }
+        req = urllib.request.Request(
+            GROQ_API, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {GROQ_KEY}"}
+        )
+        with urllib.request.urlopen(req, timeout=150) as response:
+            result = json.loads(response.read())
+        answer = result["choices"][0]["message"]["content"].strip()
+        return answer, spoken_text
+
+
+def handle_video_note(message):
+    chat_id = message["chat"]["id"]
+    if not can_use_ai(chat_id):
+        return
+    send_message(chat_id, "Сэр, анализирую видеокружок. Проверяю изображение и речь...")
+    try:
+        note = message.get("video_note") or {}
+        answer, spoken_text = analyze_video_note(note.get("file_id"), message.get("caption", ""))
+        if spoken_text:
+            last_video_transcripts[chat_id] = spoken_text
+        count_request(chat_id)
+        send_message(chat_id, answer)
+
+        # Для запроса перевода дополнительно озвучиваем результат.
+        if re.search(r"(?i)перевед|translate|translation|на английск|на немецк|на французск|на испанск", message.get("caption", "")):
+            audio_data = text_to_speech(answer)
+            if audio_data:
+                send_voice(chat_id, audio_data, "Перевод, сэр")
+    except Exception as error:
+        print("Video note handler error:", repr(error))
+        send_message(chat_id, "Сэр, не удалось обработать этот кружок. Попробуйте отправить его ещё раз или чуть короче.")
+
+
+# =========================
 # РАСПОЗНАВАНИЕ ГОЛОСОВЫХ
 # =========================
 
@@ -1723,6 +1846,11 @@ def handle_message(message):
         activate_premium(message)
         return
 
+    # Видеокружки обрабатываются отдельно: кадры + распознавание речи + перевод.
+    if message.get("video_note"):
+        handle_video_note(message)
+        return
+
     # Фото с подписью автоматически направляется в редактор.
     if message.get("photo"):
         handle_photo_edit(message)
@@ -1747,6 +1875,28 @@ def handle_message(message):
 
     command = text.split()[0].split("@")[0].lower()
 
+    # Перевод последнего кружка отдельной командой после его отправки.
+    if (chat_id in last_video_transcripts and
+            re.search(r"(?i)\b(?:переведи|перевод|translate)\b", text)):
+        target_match = re.search(
+            r"(?i)(?:на|to)\s+([а-яa-zё-]+(?:\s+[а-яa-zё-]+)?)", text
+        )
+        target_language = target_match.group(1).strip() if target_match else "английский"
+        send_message(chat_id, f"Сэр, перевожу последний кружок на {target_language}...")
+        translated = ask_ai(
+            chat_id,
+            "Переведи следующий распознанный текст полностью на " + target_language +
+            ". Сохрани смысл, имена и тон. Выведи только перевод, без пояснений.\n\n" +
+            last_video_transcripts[chat_id],
+            max_tokens=TEXT_MAX_TOKENS
+        )
+        send_message(chat_id, translated)
+        audio_data = text_to_speech(translated)
+        if audio_data:
+            send_voice(chat_id, audio_data, "Перевод последнего кружка, сэр")
+        count_request(chat_id)
+        return
+
     if command == "/start":
         user_states.pop(chat_id, None)
         get_user(chat_id)
@@ -1755,7 +1905,8 @@ def handle_message(message):
             "⚡ VORTEX на связи.\n\n"
             "Просто напиши, что нужно сделать, или отправь голосовое.\n\n"
             "Я могу создать пост, придумать идеи, ответить на вопрос, "
-            "сгенерировать изображение, отредактировать фото или создать презентацию PowerPoint.\n\n"
+            "сгенерировать изображение, отредактировать фото, создать презентацию PowerPoint "
+            "или проанализировать и перевести видеокружок.\n\n"
             "Голосовое сообщение → голосовой ответ.\n"
             "Текст → текстовый ответ.\n\n"
             "Команды: /profile, /buy, /terms, /paysupport, /cancel\n\n"
@@ -1919,6 +2070,10 @@ def handle_message(message):
     if is_voice:
         voice_prompt = (
             "Ответь кратко и естественно, максимум 2–4 предложения. "
+            "Ты персональный ИИ-помощник в духе высокотехнологичного дворецкого: "
+            "спокойный, уверенный, точный, с лёгкой сухой иронией по ситуации. "
+            "Обращайся к пользователю 'сэр' уместно, но не в каждом предложении. "
+            "Не изображай конкретного кино-персонажа и не копируй чужой голос. "
             "Не используй списки, Markdown и эмодзи. Отвечай так, чтобы "
             "это звучало естественно голосом. Вопрос пользователя: " + text
         )
