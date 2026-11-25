@@ -41,7 +41,7 @@ MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-PIPER_VOICE = "ru_RU-dmitri-medium"
+PIPER_VOICE = "ru_RU-ruslan-medium"
 PIPER_DIR = os.path.join(os.getcwd(), "piper_voices")
 piper_model = None
 
@@ -55,7 +55,7 @@ PREMIUM_DAYS = 30
 
 VOICE_MAX_TOKENS = 180
 TEXT_MAX_TOKENS = 1200
-VOICE_SPEED = "atempo=1.10"
+VOICE_SPEED = "atempo=0.96"
 
 user_states = {}
 chat_histories = {}
@@ -1444,21 +1444,39 @@ def analyze_video_note(file_id, user_request=""):
             audio_data = f.read()
         spoken_text = transcribe_audio_bytes(audio_data) if audio_data else ""
 
-        # Берём кадры в начале, середине и ближе к концу, чтобы модель видела контекст.
+        # Определяем реальную длительность: кружки часто длятся всего 2-5 секунд.
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", video_path
+        ], capture_output=True, text=True, timeout=20)
+        try:
+            duration = max(0.1, float(probe.stdout.strip()))
+        except (TypeError, ValueError):
+            duration = 3.0
+        print(f"[VIDEO NOTE] duration={duration:.2f}s, bytes={len(video_data)}")
+
+        # Берём кадры внутри длительности, а не ищем кадр на 4-й секунде
+        # у трёхсекундного кружка.
         frame_paths = []
-        for index, seek in enumerate((0.5, 2.0, 4.0)):
+        if duration <= 1.2:
+            seeks = [duration * 0.5]
+        else:
+            seeks = [duration * 0.12, duration * 0.50, duration * 0.88]
+        for index, seek in enumerate(seeks):
             frame_path = os.path.join(temp_dir, f"frame_{index}.jpg")
             result = subprocess.run([
-                "ffmpeg", "-y", "-ss", str(seek), "-i", video_path,
+                "ffmpeg", "-y", "-ss", f"{max(0, seek):.3f}", "-i", video_path,
                 "-frames:v", "1", "-vf", "scale='min(640,iw)':-2",
                 "-q:v", "5", frame_path
             ], capture_output=True, timeout=45)
-            if result.returncode == 0 and os.path.exists(frame_path):
+            if result.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
                 frame_paths.append(frame_path)
 
         content = [{"type": "text", "text": (
-            "Проанализируй видеокружок. Опиши только то, что действительно видно. "
-            "Учитывай распознанную речь и ответь на запрос пользователя. "
+            "Проанализируй короткое видеосообщение Telegram (видеокружок). "
+            "Оно может длиться всего 1-5 секунд: это нормально, не называй его слишком длинным "
+            "и не отказывайся из-за длительности. Используй все переданные кадры и распознанную речь. "
+            "Опиши только то, что действительно видно. Ответь на запрос пользователя. "
             "Если пользователь просит перевод, переведи распознанную речь полностью, "
             "сохраняя смысл и тон, без пересказа. Не выдумывай отсутствующие слова.\n"
             f"Распознанная речь: {spoken_text or 'Речь не распознана.'}\n"
@@ -1479,7 +1497,8 @@ def analyze_video_note(file_id, user_request=""):
                     "Обращайся к пользователю 'сэр' естественно, не в каждом предложении. "
                     "Отвечай по-русски, если не просят другой язык. "
                     "Не используй Markdown, хештеги и декоративные символы. "
-                    "Не придумывай детали, которых нет в видео или аудио."
+                    "Не придумывай детали, которых нет в видео или аудио. "
+                    "Короткая длительность кружка не является причиной отказа: анализируй доступные кадры."
                 )},
                 {"role": "user", "content": content}
             ],
