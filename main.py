@@ -4,10 +4,12 @@ import json
 import time
 import uuid
 import base64
+import io
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
+from PIL import Image
 
 TOKEN = os.environ["BOT_TOKEN"]
 GROQ_KEY = os.environ["GROQ_API_KEY"]
@@ -765,39 +767,95 @@ def edit_image(image_data, instruction):
         print("Cloudflare credentials are missing")
         return None
 
-    prompt = prepare_edit_prompt(instruction)
-
-    boundary = "----VORTEX" + uuid.uuid4().hex
-
-    body = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="prompt"\r\n\r\n'
-        f"{prompt}\r\n"
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="input_image_0"; '
-        'filename="input.jpg"\r\n'
-        "Content-Type: image/jpeg\r\n\r\n"
-    ).encode() + image_data + (
-        f"\r\n--{boundary}\r\n"
-        'Content-Disposition: form-data; name="width"\r\n\r\n'
-        "1024\r\n"
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="height"\r\n\r\n'
-        "1024\r\n"
-        f"--{boundary}--\r\n"
-    ).encode()
-
-    req = urllib.request.Request(
-        CF_EDIT_API,
-        data=body,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Authorization": f"Bearer {CF_API_TOKEN}",
-            "User-Agent": "VORTEX-Bot/1.0"
-        }
-    )
-
     try:
+        # Открываем оригинальное фото
+        image = Image.open(io.BytesIO(image_data))
+        image.load()
+
+        print(
+            "Original image:",
+            image.format,
+            image.size
+        )
+
+        # Учитываем ориентацию фотографии из EXIF
+        from PIL import ImageOps
+        image = ImageOps.exif_transpose(image)
+
+        # Переводим изображение в RGB
+        if image.mode != "RGB":
+            if image.mode in ("RGBA", "LA"):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(
+                    rgba,
+                    mask=rgba.getchannel("A")
+                )
+                image = background
+            else:
+                image = image.convert("RGB")
+
+        # Cloudflare требует входное изображение меньше 512x512
+        image.thumbnail((511, 511), Image.Resampling.LANCZOS)
+
+        width, height = image.size
+
+        if width >= 512 or height >= 512:
+            raise Exception(
+                f"Размер изображения превышает лимит: {width}x{height}"
+            )
+
+        output = io.BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=90,
+            optimize=True
+        )
+
+        resized_data = output.getvalue()
+
+        print(
+            "Image resized:",
+            width,
+            "x",
+            height,
+            "bytes:",
+            len(resized_data)
+        )
+
+        prompt = prepare_edit_prompt(instruction)
+
+        boundary = "----VORTEX" + uuid.uuid4().hex
+
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+            f"{prompt}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="input_image_0"; '
+            'filename="input.jpg"\r\n'
+            "Content-Type: image/jpeg\r\n\r\n"
+        ).encode() + resized_data + (
+            f"\r\n--{boundary}\r\n"
+            'Content-Disposition: form-data; name="width"\r\n\r\n'
+            "1024\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="height"\r\n\r\n'
+            "1024\r\n"
+            f"--{boundary}--\r\n"
+        ).encode()
+
+        req = urllib.request.Request(
+            CF_EDIT_API,
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Authorization": f"Bearer {CF_API_TOKEN}",
+                "User-Agent": "VORTEX-Bot/1.0"
+            }
+        )
+
         print("Starting image edit...")
         print("Edit instruction:", prompt)
 
@@ -860,48 +918,42 @@ def handle_photo_edit(message):
         return
 
     if len(caption) > 1500:
-        send_message(chat_id, "❌ Слишком длинная команда. Сократи её до 1500 символов.")
+        send_message(
+            chat_id,
+            "❌ Слишком длинная команда. Сократи её до 1500 символов."
+        )
         return
 
     photos = message.get("photo", [])
 
     if not photos:
+        send_message(chat_id, "❌ Не удалось получить фотографию.")
         return
 
-    # Telegram обычно присылает несколько размеров.
-    # Берём самый большой вариант, который укладывается в лимит 512x512.
-    suitable = [
-        photo for photo in photos
-        if photo.get("width", 9999) < 512
-        and photo.get("height", 9999) < 512
-    ]
-
-    if suitable:
-        selected_photo = max(
-            suitable,
-            key=lambda item: item.get("file_size", 0)
+    # Берём самое большое качество, которое прислал Telegram.
+    # Затем уменьшаем его до нужного размера в edit_image().
+    selected_photo = max(
+        photos,
+        key=lambda item: (
+            item.get("width", 0) * item.get("height", 0)
         )
-    else:
-        # Если подходящего размера нет, берём самый маленький.
-        selected_photo = min(
-            photos,
-            key=lambda item: (
-                item.get("width", 9999) *
-                item.get("height", 9999)
-            )
-        )
+    )
 
     send_message(
         chat_id,
         "🎨 VORTEX получил фотографию и команду.\n\n"
-        "Сейчас попробую изменить изображение. Это может занять некоторое время."
+        "Подготавливаю изображение и начинаю редактирование. "
+        "Это может занять некоторое время."
     )
 
     try:
         image_data = download_telegram_file(selected_photo["file_id"])
 
         if not image_data:
-            send_message(chat_id, "❌ Не удалось загрузить фотографию из Telegram.")
+            send_message(
+                chat_id,
+                "❌ Не удалось загрузить фотографию из Telegram."
+            )
             return
 
         print(
@@ -918,8 +970,7 @@ def handle_photo_edit(message):
             send_message(
                 chat_id,
                 "❌ Не удалось отредактировать фото.\n\n"
-                "Проверь логи Railway. Возможно, Cloudflare отклонил "
-                "размер или формат изображения.",
+                "Посмотри ошибку Cloudflare в логах Railway.",
                 keyboard
             )
             return
@@ -1063,7 +1114,7 @@ def handle_message(message):
         activate_premium(message)
         return
 
-    # ФОТО С ПОДПИСЬЮ: один запрос, одно сообщение
+    # ФОТО С ПОДПИСЬЮ
     if message.get("photo"):
         handle_photo_edit(message)
         return
