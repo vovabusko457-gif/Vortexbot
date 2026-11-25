@@ -1619,31 +1619,28 @@ def analyze_video_note(file_id, user_request=""):
         else:
             print("[VIDEO NOTE] no audio stream; continuing with video frames")
 
-        # Для длинного ролика берём равномерно распределённые кадры по всей длительности.
+        # Vision-модель Groq принимает не более 3 изображений за один запрос.
+        # Берём три кадра внутри ролика, не попадая точно на конец файла.
         frame_paths = []
         if has_video:
             if duration > 0.1:
-                frame_count = min(24, max(5, int(duration / 2.5) + 1))
-                if frame_count == 1:
-                    seeks = [duration / 2]
-                else:
-                    seeks = [duration * i / (frame_count - 1) for i in range(frame_count)]
+                seeks = [duration * 0.15, duration * 0.50, duration * 0.85]
             else:
-                seeks = [0.0, 0.5, 1.0]
+                seeks = [0.0]
 
             for index, seek in enumerate(seeks):
                 frame_path = os.path.join(temp_dir, f"frame_{index}.jpg")
                 frame_result = subprocess.run(
-                    ["ffmpeg", "-y", "-ss", f"{max(0.0, seek):.3f}",
-                     "-i", video_path, "-frames:v", "1",
+                    ["ffmpeg", "-y", "-i", video_path,
+                     "-ss", f"{max(0.0, seek):.3f}", "-frames:v", "1",
                      "-vf", "scale=640:640:force_original_aspect_ratio=decrease",
                      "-q:v", "5", frame_path],
                     capture_output=True, text=True, timeout=45
                 )
                 if frame_result.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
-                    frame_paths.append(frame_path)
+                    frame_paths.append((frame_path, seek))
                 else:
-                    print(f"[VIDEO NOTE] frame {index} failed:", (frame_result.stderr or "")[-500:])
+                    print(f"[VIDEO NOTE] frame {index} failed at {seek:.2f}s:", (frame_result.stderr or "")[-500:])
 
         if not frame_paths and not spoken_text:
             raise RuntimeError("Не удалось получить ни кадры, ни распознанную речь из видео.")
@@ -1674,10 +1671,9 @@ def analyze_video_note(file_id, user_request=""):
             f"Запрос пользователя: {user_request or 'Кратко и точно опиши только то, что можно уверенно увидеть или услышать.'}"
         )}]
 
-        for frame_index, frame_path in enumerate(frame_paths):
+        for frame_index, (frame_path, timestamp) in enumerate(frame_paths):
             with open(frame_path, "rb") as f:
                 encoded = base64.b64encode(f.read()).decode("ascii")
-            timestamp = seeks[frame_index] if frame_index < len(seeks) else 0.0
             content.append({"type": "text", "text": f"Кадр {frame_index + 1}, время примерно {timestamp:.1f} сек."})
             content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}})
 
