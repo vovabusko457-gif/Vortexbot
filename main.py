@@ -112,11 +112,12 @@ def send_message(chat_id, text, menu=None):
         "text": text
     }
 
-    if menu:
-        data["reply_markup"] = json.dumps(
-            menu,
-            ensure_ascii=False
-        )
+    # VORTEX работает без постоянной клавиатуры.
+    # Сохраняем только inline-кнопки, например проверку подписки.
+    if menu and menu.get("inline_keyboard"):
+        data["reply_markup"] = json.dumps(menu, ensure_ascii=False)
+    else:
+        data["reply_markup"] = json.dumps({"remove_keyboard": True})
 
     tg_request("sendMessage", data)
 
@@ -1440,6 +1441,37 @@ def handle_callback(callback):
 # ОБРАБОТКА СООБЩЕНИЙ
 # =========================
 
+def detect_intent(text):
+    """Простая маршрутизация естественных запросов без кнопок."""
+    value = text.lower().strip()
+
+    image_words = (
+        "нарисуй", "создай картинку", "создай изображение",
+        "сгенерируй картинку", "сгенерируй изображение",
+        "сделай картинку", "сделай изображение", "изобрази",
+        "нарисовать", "генерация изображения", "сгенерируй фото"
+    )
+    if any(word in value for word in image_words):
+        return "image"
+
+    ideas_words = (
+        "идеи для", "придумай идеи", "дай идеи", "идеи контента",
+        "идеи постов", "контент-план", "контент план"
+    )
+    if any(word in value for word in ideas_words):
+        return "ideas"
+
+    post_words = (
+        "напиши пост", "создай пост", "сделай пост", "пост для",
+        "напиши реклам", "рекламный текст", "текст объявления",
+        "описание товара", "напиши описание", "составь объявление"
+    )
+    if any(word in value for word in post_words):
+        return "post"
+
+    return "chat"
+
+
 def handle_message(message):
     chat_id = message["chat"]["id"]
 
@@ -1447,6 +1479,7 @@ def handle_message(message):
         activate_premium(message)
         return
 
+    # Фото с подписью автоматически направляется в редактор.
     if message.get("photo"):
         handle_photo_edit(message)
         return
@@ -1456,386 +1489,190 @@ def handle_message(message):
 
     if is_voice:
         total_started = time.perf_counter()
-
         if not can_use_ai(chat_id):
             return
-
-        recognized_text = transcribe_voice(
-            message["voice"]["file_id"]
-        )
-
+        recognized_text = transcribe_voice(message["voice"]["file_id"])
         if not recognized_text:
-            send_message(
-                chat_id,
-                "❌ Не удалось распознать голосовое.\n"
-                "Попробуй отправить ещё раз.",
-                keyboard
-            )
+            send_message(chat_id, "❌ Не удалось распознать голосовое. Попробуй отправить ещё раз.")
             return
-
         text = recognized_text
-
         print("[VOICE] Recognized:", text)
 
     if not text:
         return
 
-    if text == "/start":
+    command = text.split()[0].split("@")[0].lower()
+
+    if command == "/start":
         user_states.pop(chat_id, None)
         get_user(chat_id)
-
         send_message(
             chat_id,
-            "⚡ VORTEX — ТВОЙ ЛИЧНЫЙ ИИ-ПОМОЩНИК\n\n"
-            "Привет! Я VORTEX. Помогаю превращать "
-            "идеи в готовые результаты.\n\n"
-            "✍️ Создаю посты для соцсетей\n"
-            "💡 Генерирую идеи для контента\n"
-            "🎨 Создаю изображения по описанию\n"
-            "🖼️ Редактирую фотографии по подписи\n"
-            "🧠 Отвечаю на вопросы\n"
-            "🎙️ Распознаю голосовые сообщения и отвечаю голосом\n"
-            "🔥 Улучшаю и редактирую тексты\n\n"
-            "Выбирай функцию в меню или просто напиши мне.\n\n"
-            "VORTEX. Твои идеи. Мои возможности. ⚡",
-            keyboard
+            "⚡ VORTEX на связи.\n\n"
+            "Просто напиши, что нужно сделать, или отправь голосовое.\n\n"
+            "Я могу создать пост, придумать идеи, ответить на вопрос, "
+            "сгенерировать изображение или отредактировать присланное фото.\n\n"
+            "Голосовое сообщение → голосовой ответ.\n"
+            "Текст → текстовый ответ.\n\n"
+            "Команды: /profile, /buy, /terms, /paysupport, /cancel\n\n"
+            "VORTEX. Твои идеи. Мои возможности. ⚡"
         )
         return
 
-    if text == "/terms":
-        send_message(
-            chat_id,
+    if command == "/terms":
+        send_message(chat_id,
             "📄 Условия VORTEX PREMIUM\n\n"
-            "1. Premium предоставляет доступ к функциям "
-            "VORTEX на 30 дней.\n"
-            "2. Стоимость одного периода: 65 Telegram Stars.\n"
-            "3. Доступ активируется после подтверждения "
-            "успешного платежа Telegram.\n"
+            "1. Premium предоставляет доступ к функциям VORTEX на 30 дней.\n"
+            "2. Стоимость: 65 Telegram Stars.\n"
+            "3. Доступ активируется после подтверждения успешного платежа Telegram.\n"
             "4. Подписка не продлевается автоматически.\n"
             "5. Для продления необходимо совершить новый платёж.\n"
-            "6. По вопросам оплаты используй команду /paysupport."
-        )
+            "6. По вопросам оплаты используй /paysupport.")
         return
 
-    if text == "/paysupport":
-        send_message(
-            chat_id,
+    if command == "/paysupport":
+        send_message(chat_id,
             "🛟 Поддержка VORTEX\n\n"
-            "Если возникла проблема с оплатой, напиши "
-            "владельцу бота через контакт, указанный "
-            "в канале @VORTEX_RELAX.\n\n"
-            "Сохрани чек Telegram, он поможет проверить платёж."
-        )
+            "Если возникла проблема с оплатой, напиши владельцу бота "
+            "через контакт, указанный в канале @VORTEX_RELAX.\n\n"
+            "Сохрани чек Telegram, он поможет проверить платёж.")
         return
 
-    if text in ["/cancel", "❌ Отмена"]:
+    if command == "/cancel":
         user_states.pop(chat_id, None)
-        send_message(chat_id, "Действие отменено.", keyboard)
+        send_message(chat_id, "Хорошо, отменил последнее действие. Можем начать заново.")
         return
 
-    if text in ["/buy", "💎 Купить Premium"]:
+    if command in ("/buy", "/premium"):
         payment_message(chat_id)
         return
 
-    if text == "✨ Возможности":
-        send_message(
-            chat_id,
-            "✨ Возможности VORTEX:\n\n"
-            "• Создание постов с помощью ИИ\n"
-            "• Идеи для контента\n"
-            "• Помощь с текстами\n"
-            "• Ответы на вопросы\n"
-            "• Разные стили написания\n"
-            "• 🎙️ Распознавание голосовых и голосовые ответы\n"
-            "• 🎨 Генерация изображений\n"
-            "• 🖼️ Редактирование фотографий по подписи\n\n"
-            "💎 Premium: 65 Stars за 30 дней.",
-            keyboard
-        )
+    if command in ("/profile", "/me"):
+        user = get_user(chat_id)
+        access = check_access(chat_id)
+        if access == "free":
+            status = f"Бесплатные запросы: {user['requests']}/{FREE_REQUESTS}"
+        elif access == "trial":
+            trial_end = parse_date(user.get("trial_until"))
+            status = f"Статус: бесплатный доступ до {trial_end.strftime('%d.%m.%Y')} UTC"
+        elif access == "paid":
+            paid_end = parse_date(user.get("paid_until"))
+            status = f"Статус: 💎 PREMIUM до {paid_end.strftime('%d.%m.%Y %H:%M')} UTC"
+        elif access == "expired":
+            status = "Статус: доступ закончился"
+        else:
+            status = "Статус: требуется подписка на канал"
+        send_message(chat_id,
+            f"👤 Твой профиль\nID: {chat_id}\n\n{status}\n\n"
+            f"💎 Premium: {STARS_PRICE} Stars / 30 дней")
         return
 
-    if text == "✍️ Создать пост":
-        user_states[chat_id] = {"step": "topic"}
-
-        send_message(
-            chat_id,
-            "✍️ На какую тему создаём пост?\n\n"
-            "Напиши тему одним сообщением.",
-            {
-                "keyboard": [[{"text": "❌ Отмена"}]],
-                "resize_keyboard": True
-            }
-        )
+    # Совместимость со старыми текстовыми командами меню.
+    lowered = text.lower()
+    if text == "💎 Купить Premium":
+        payment_message(chat_id)
         return
-
-    if text == "🎨 Создать картинку":
-        user_states[chat_id] = {"step": "image_prompt"}
-
-        send_message(
-            chat_id,
-            "🎨 VORTEX готов создать изображение!\n\n"
-            "Опиши, что хочешь увидеть.\n\n"
-            "Например:\n"
-            "«Футуристический город ночью, "
-            "неоновые вывески, дождь, кинематографичный стиль»\n\n"
-            "Можешь писать даже коротко. Я сам дополню детали.",
-            {
-                "keyboard": [[{"text": "❌ Отмена"}]],
-                "resize_keyboard": True
-            }
-        )
-        return
-
-    if text == "💡 Идеи для контента":
-        user_states[chat_id] = {"step": "ideas"}
-
-        send_message(
-            chat_id,
-            "💡 Для какой ниши нужны идеи?\n\n"
-            "Например: магазин одежды, техника, спорт.",
-            {
-                "keyboard": [[{"text": "❌ Отмена"}]],
-                "resize_keyboard": True
-            }
-        )
-        return
-
     if text == "👤 Мой профиль":
         user = get_user(chat_id)
         access = check_access(chat_id)
-
-        if access == "free":
-            status = (
-                f"Бесплатные запросы: "
-                f"{user['requests']}/{FREE_REQUESTS}"
-            )
-
-        elif access == "trial":
-            trial_end = parse_date(user.get("trial_until"))
-            status = (
-                "Статус: бесплатный доступ\n"
-                f"До: {trial_end.strftime('%d.%m.%Y')} UTC"
-            )
-
-        elif access == "paid":
-            paid_end = parse_date(user.get("paid_until"))
-            status = (
-                "Статус: 💎 PREMIUM\n"
-                f"До: {paid_end.strftime('%d.%m.%Y %H:%M')} UTC"
-            )
-
-        elif access == "expired":
-            status = "Статус: доступ закончился"
-
-        else:
-            status = "Статус: требуется подписка на канал"
-
-        send_message(
-            chat_id,
-            f"👤 Твой профиль\n"
-            f"ID: {chat_id}\n\n"
-            f"{status}\n\n"
-            f"💎 Premium: {STARS_PRICE} Stars / 30 дней",
-            keyboard
-        )
+        status = f"Запросы: {user['requests']}/{FREE_REQUESTS}" if access == "free" else f"Статус доступа: {access}"
+        send_message(chat_id, f"👤 Твой профиль\n\n{status}\n💎 Premium: {STARS_PRICE} Stars / 30 дней")
+        return
+    if text == "✨ Возможности":
+        send_message(chat_id,
+            "Я умею создавать посты, придумывать идеи, отвечать на вопросы, "
+            "генерировать изображения и редактировать фотографии. "
+            "Просто напиши задачу обычными словами.")
         return
 
-    state = user_states.get(chat_id, {})
-
-    if state.get("step") == "image_prompt":
-        if not can_use_ai(chat_id):
-            return
-
-        if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-            send_message(
-                chat_id,
-                "❌ Генерация пока не настроена.\n"
-                "Проверь переменные Cloudflare в Railway.",
-                keyboard
-            )
-            return
-
-        if len(text) > 2048:
-            send_message(
-                chat_id,
-                "❌ Описание слишком длинное.\n"
-                "Максимум 2048 символов. Сократи описание.",
-                keyboard
-            )
-            return
-
-        user_states.pop(chat_id, None)
-
-        send_message(
-            chat_id,
-            "🎨 VORTEX анализирует твою задумку и создаёт изображение...\n\n"
-            "Сначала я продумываю сцену, затем рисую её."
-        )
-
-        image_data = generate_image(text)
-
-        if not image_data:
-            send_message(
-                chat_id,
-                "❌ Не удалось создать изображение.\n\n"
-                "Возможно, временно недоступен Cloudflare "
-                "или закончилась дневная квота.\n"
-                "Попробуй немного позже.",
-                keyboard
-            )
-            return
-
-        try:
-            send_photo(
-                chat_id,
-                image_data,
-                "⚡ Создано с помощью VORTEX"
-            )
-            count_request(chat_id)
-
-        except Exception as error:
-            print("Telegram sendPhoto error:", error)
-            send_message(
-                chat_id,
-                "Изображение создано, но Telegram не смог "
-                "его отправить. Попробуй ещё раз.",
-                keyboard
-            )
-
-        return
-
-    if state.get("step") == "topic":
-        user_states[chat_id] = {
-            "step": "style",
-            "topic": text
-        }
-
-        send_message(
-            chat_id,
-            "Выбери стиль будущего поста:",
-            style_keyboard
-        )
-        return
-
-    if state.get("step") == "style":
-        styles = {
-            "💼 Деловой": "деловой и экспертный",
-            "🔥 Продающий": "продающий, убедительный",
-            "🤝 Дружеский": "дружеский, простой и живой"
-        }
-
-        if text not in styles:
-            send_message(
-                chat_id,
-                "Выбери один из предложенных стилей.",
-                style_keyboard
-            )
-            return
-
-        if not can_use_ai(chat_id):
-            return
-
-        topic = state["topic"]
-        style = styles[text]
-
-        user_states.pop(chat_id, None)
-
-        send_message(chat_id, "⚡ VORTEX создаёт твой пост...")
-
-        answer = ask_ai(
-            chat_id,
-            f"Создай готовый пост на тему: {topic}. "
-            f"Стиль: {style}. Добавь заголовок, "
-            "основной текст и призыв к действию."
-        )
-
-        count_request(chat_id)
-        send_message(chat_id, answer, keyboard)
-        return
-
-    if state.get("step") == "ideas":
-        if not can_use_ai(chat_id):
-            return
-
-        user_states.pop(chat_id, None)
-
-        send_message(chat_id, "💡 Подбираю идеи...")
-
-        answer = ask_ai(
-            chat_id,
-            f"Придумай 10 интересных идей для контента "
-            f"в нише: {text}. К каждой добавь описание."
-        )
-
-        count_request(chat_id)
-        send_message(chat_id, answer, keyboard)
-        return
+    # Старые незавершённые сценарии не должны перехватывать новые сообщения.
+    user_states.pop(chat_id, None)
 
     if not can_use_ai(chat_id):
         return
 
+    intent = "chat" if is_voice else detect_intent(text)
+
+    if intent == "image":
+        if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+            send_message(chat_id, "❌ Генерация пока не настроена. Проверь переменные Cloudflare в Railway.")
+            return
+        if len(text) > 2048:
+            send_message(chat_id, "❌ Описание слишком длинное. Максимум 2048 символов.")
+            return
+        prompt = re.sub(
+            r"(?i)^\s*(нарисуй|нарисовать|изобрази|создай картинку|создай изображение|сгенерируй картинку|сгенерируй изображение|сделай картинку|сделай изображение|сгенерируй фото)\s*[:,\-]?\s*",
+            "", text
+        ).strip() or text
+        send_message(chat_id, "🎨 Понял. Продумываю сцену и создаю изображение...")
+        image_data = generate_image(prompt)
+        if not image_data:
+            send_message(chat_id, "❌ Не удалось создать изображение. Возможно, временно недоступен Cloudflare или закончилась квота. Попробуй позже.")
+            return
+        try:
+            send_photo(chat_id, image_data, "⚡ Создано с помощью VORTEX")
+            count_request(chat_id)
+        except Exception as error:
+            print("Telegram sendPhoto error:", error)
+            send_message(chat_id, "Изображение создано, но Telegram не смог его отправить. Попробуй ещё раз.")
+        return
+
+    if intent == "post":
+        send_message(chat_id, "✍️ Понял. Подготовлю готовый пост...")
+        prompt = (
+            "Создай готовый качественный пост по запросу пользователя. "
+            "Если стиль не указан, выбери подходящий сам. Добавь сильный заголовок, "
+            "основной текст и уместный призыв к действию. Не задавай вопросы, "
+            "если данных достаточно. Запрос: " + text
+        )
+        answer = ask_ai(chat_id, prompt, max_tokens=TEXT_MAX_TOKENS)
+        count_request(chat_id)
+        send_message(chat_id, answer)
+        return
+
+    if intent == "ideas":
+        send_message(chat_id, "💡 Понял. Собираю идеи...")
+        answer = ask_ai(
+            chat_id,
+            "Придумай 10 конкретных и разнообразных идей для контента "
+            "по запросу пользователя. Для каждой дай короткое описание. Запрос: " + text,
+            max_tokens=TEXT_MAX_TOKENS
+        )
+        count_request(chat_id)
+        send_message(chat_id, answer)
+        return
+
+    # Обычный разговор с ИИ.
     if not is_voice:
-        send_message(chat_id, "⚡ Думаю над ответом...")
+        send_message(chat_id, "⚡ Думаю...")
 
     if is_voice:
         voice_prompt = (
             "Ответь кратко и естественно, максимум 2–4 предложения. "
-            "Не используй списки, Markdown и эмодзи. "
-            "Отвечай так, чтобы это звучало естественно голосом. "
-            "Вопрос пользователя: " + text
+            "Не используй списки, Markdown и эмодзи. Отвечай так, чтобы "
+            "это звучало естественно голосом. Вопрос пользователя: " + text
         )
-
-        answer = ask_ai(
-            chat_id,
-            voice_prompt,
-            max_tokens=VOICE_MAX_TOKENS
-        )
+        answer = ask_ai(chat_id, voice_prompt, max_tokens=VOICE_MAX_TOKENS)
     else:
-        answer = ask_ai(
-            chat_id,
-            text,
-            max_tokens=TEXT_MAX_TOKENS
-        )
+        answer = ask_ai(chat_id, text, max_tokens=TEXT_MAX_TOKENS)
 
     count_request(chat_id)
 
     if is_voice:
         audio_data = text_to_speech(answer)
-
         if audio_data:
             try:
                 send_started = time.perf_counter()
-
                 send_voice(chat_id, audio_data)
-
-                print(
-                    f"[SPEED] Telegram sendVoice: "
-                    f"{time.perf_counter() - send_started:.2f} sec"
-                )
-
+                print(f"[SPEED] Telegram sendVoice: {time.perf_counter() - send_started:.2f} sec")
             except Exception as error:
                 print("Voice sending error:", error)
-                send_message(
-                    chat_id,
-                    "❌ Не получилось отправить голосовой ответ. "
-                    "Попробуй ещё раз.",
-                    keyboard
-                )
+                send_message(chat_id, "❌ Не получилось отправить голосовой ответ. Попробуй ещё раз.")
         else:
-            send_message(
-                chat_id,
-                "❌ Не получилось создать голосовой ответ. "
-                "Попробуй ещё раз.",
-                keyboard
-            )
-
-        print(
-            f"[SPEED] TOTAL voice: "
-            f"{time.perf_counter() - total_started:.2f} sec"
-        )
-
+            send_message(chat_id, "❌ Не получилось создать голосовой ответ. Попробуй ещё раз.")
+        print(f"[SPEED] TOTAL voice: {time.perf_counter() - total_started:.2f} sec")
     else:
-        send_message(chat_id, answer, keyboard)
+        send_message(chat_id, answer)
 
 
 # =========================
