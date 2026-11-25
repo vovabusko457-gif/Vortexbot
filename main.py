@@ -876,8 +876,13 @@ def decide_web_search(question):
         "max_completion_tokens": 100
     }
     req = urllib.request.Request(
-        GROQ_API, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_KEY}"}
+        GROQ_API,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_KEY}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
     )
     try:
         with urllib.request.urlopen(req, timeout=25) as response:
@@ -885,12 +890,20 @@ def decide_web_search(question):
         raw = result["choices"][0]["message"]["content"].strip()
         match = re.search(r"\{[\s\S]*\}", raw)
         if not match:
+            print("[WEB SEARCH] Classifier returned non-JSON:", raw[:1000])
             return None
         decision = json.loads(match.group(0))
         if decision.get("search") and str(decision.get("query", "")).strip():
             return str(decision["query"]).strip()[:300]
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        print(
+            "[WEB SEARCH] Groq classifier HTTP error:",
+            error.code,
+            details[:2000]
+        )
     except Exception as error:
-        print("[WEB SEARCH] Intent detection error:", error)
+        print("[WEB SEARCH] Intent detection error:", repr(error))
     return None
 
 
@@ -901,7 +914,11 @@ def search_web(query):
     payload = {"query": query, "limit": 5, "sources": ["web", "news"], "country": "RU"}
     req = urllib.request.Request(
         FIRECRAWL_API, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {FIRECRAWL_KEY}"}
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {FIRECRAWL_KEY}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
     )
     try:
         with urllib.request.urlopen(req, timeout=45) as response:
