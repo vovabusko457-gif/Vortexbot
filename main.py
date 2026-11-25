@@ -51,6 +51,10 @@ TRIAL_DAYS = 7
 STARS_PRICE = 65
 PREMIUM_DAYS = 30
 
+VOICE_MAX_TOKENS = 350
+TEXT_MAX_TOKENS = 1200
+VOICE_SPEED = "atempo=1.10"
+
 user_states = {}
 chat_histories = {}
 users = {}
@@ -177,6 +181,8 @@ def send_voice(chat_id, audio_data, caption=""):
 
 
 def download_telegram_file(file_id):
+    started = time.perf_counter()
+
     info = tg_request("getFile", {"file_id": file_id})
 
     if not info.get("ok"):
@@ -186,7 +192,14 @@ def download_telegram_file(file_id):
     url = TG_FILE_API + file_path
 
     with urllib.request.urlopen(url, timeout=60) as response:
-        return response.read()
+        file_data = response.read()
+
+    print(
+        f"[SPEED] Telegram download: "
+        f"{time.perf_counter() - started:.2f} sec"
+    )
+
+    return file_data
 
 
 # =========================
@@ -234,13 +247,21 @@ def load_piper_model():
     if not os.path.exists(model_path):
         raise Exception("Файл модели Piper не найден")
 
+    started = time.perf_counter()
     piper_model = PiperVoice.load(model_path)
+
     print("Piper voice loaded:", PIPER_VOICE)
+    print(
+        f"[SPEED] Piper model loading: "
+        f"{time.perf_counter() - started:.2f} sec"
+    )
 
     return piper_model
 
 
 def text_to_speech(text):
+    started = time.perf_counter()
+
     try:
         if not text or not text.strip():
             return None
@@ -251,14 +272,24 @@ def text_to_speech(text):
             wav_path = os.path.join(temp_dir, "voice.wav")
             ogg_path = os.path.join(temp_dir, "voice.ogg")
 
+            synthesis_started = time.perf_counter()
+
             with wave.open(wav_path, "wb") as wav_file:
                 voice.synthesize_wav(text.strip(), wav_file)
+
+            print(
+                f"[SPEED] Piper synthesis: "
+                f"{time.perf_counter() - synthesis_started:.2f} sec"
+            )
+
+            ffmpeg_started = time.perf_counter()
 
             subprocess.run(
                 [
                     "ffmpeg",
                     "-y",
                     "-i", wav_path,
+                    "-filter:a", VOICE_SPEED,
                     "-c:a", "libopus",
                     "-b:a", "48k",
                     "-ac", "1",
@@ -270,11 +301,20 @@ def text_to_speech(text):
                 timeout=120
             )
 
+            print(
+                f"[SPEED] FFmpeg: "
+                f"{time.perf_counter() - ffmpeg_started:.2f} sec"
+            )
+
             with open(ogg_path, "rb") as audio:
                 audio_data = audio.read()
 
             if audio_data:
                 print("Piper audio generated:", len(audio_data), "bytes")
+                print(
+                    f"[SPEED] Piper total: "
+                    f"{time.perf_counter() - started:.2f} sec"
+                )
                 return audio_data
 
         return None
@@ -641,7 +681,7 @@ def count_request(chat_id):
 # ИИ GROQ
 # =========================
 
-def ask_ai(chat_id, prompt):
+def ask_ai(chat_id, prompt, max_tokens=TEXT_MAX_TOKENS):
     history = chat_histories.get(chat_id, [])
 
     messages = [
@@ -673,7 +713,7 @@ def ask_ai(chat_id, prompt):
         "model": MODEL,
         "messages": messages,
         "temperature": 0.7,
-        "max_completion_tokens": 1200
+        "max_completion_tokens": max_tokens
     }
 
     req = urllib.request.Request(
@@ -685,6 +725,8 @@ def ask_ai(chat_id, prompt):
             "User-Agent": "VORTEX-Bot/1.0"
         }
     )
+
+    started = time.perf_counter()
 
     try:
         with urllib.request.urlopen(req, timeout=90) as response:
@@ -704,6 +746,11 @@ def ask_ai(chat_id, prompt):
 
         chat_histories[chat_id] = history[-10:]
         save_history()
+
+        print(
+            f"[SPEED] Groq: "
+            f"{time.perf_counter() - started:.2f} sec"
+        )
 
         return answer.strip()
 
@@ -1170,6 +1217,8 @@ def handle_photo_edit(message):
 # =========================
 
 def transcribe_voice(file_id):
+    started = time.perf_counter()
+
     try:
         audio_data = download_telegram_file(file_id)
 
@@ -1211,6 +1260,11 @@ def transcribe_voice(file_id):
             result = json.loads(response.read())
 
         recognized = result.get("text", "").strip()
+
+        print(
+            f"[SPEED] Whisper total: "
+            f"{time.perf_counter() - started:.2f} sec"
+        )
 
         return recognized or None
 
@@ -1293,8 +1347,9 @@ def handle_message(message):
     text = message.get("text", "").strip()
     is_voice = bool(message.get("voice"))
 
-    # Голосовое распознаём без промежуточных текстовых сообщений
     if is_voice:
+        total_started = time.perf_counter()
+
         if not can_use_ai(chat_id):
             return
 
@@ -1312,6 +1367,8 @@ def handle_message(message):
             return
 
         text = recognized_text
+
+        print("[VOICE] Recognized:", text)
 
     if not text:
         return
@@ -1610,22 +1667,38 @@ def handle_message(message):
     if not can_use_ai(chat_id):
         return
 
-    # Для текста оставляем привычное сообщение о процессе.
-    # Для голосового никаких промежуточных сообщений не отправляем.
     if not is_voice:
         send_message(chat_id, "⚡ Думаю над ответом...")
 
-    answer = ask_ai(chat_id, text)
+    if is_voice:
+        answer = ask_ai(
+            chat_id,
+            text,
+            max_tokens=VOICE_MAX_TOKENS
+        )
+    else:
+        answer = ask_ai(
+            chat_id,
+            text,
+            max_tokens=TEXT_MAX_TOKENS
+        )
 
     count_request(chat_id)
 
     if is_voice:
-        # Голосовое на входе = только голосовое на выходе.
         audio_data = text_to_speech(answer)
 
         if audio_data:
             try:
+                send_started = time.perf_counter()
+
                 send_voice(chat_id, audio_data)
+
+                print(
+                    f"[SPEED] Telegram sendVoice: "
+                    f"{time.perf_counter() - send_started:.2f} sec"
+                )
+
             except Exception as error:
                 print("Voice sending error:", error)
                 send_message(
@@ -1641,8 +1714,13 @@ def handle_message(message):
                 "Попробуй ещё раз.",
                 keyboard
             )
+
+        print(
+            f"[SPEED] TOTAL voice: "
+            f"{time.perf_counter() - total_started:.2f} sec"
+        )
+
     else:
-        # Текст на входе = только текст на выходе.
         send_message(chat_id, answer, keyboard)
 
 
