@@ -1,14 +1,16 @@
+
 import os
 import json
 import time
 import uuid
 import base64
 import io
+import asyncio
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
-from PIL import Image
+from PIL import Image, ImageOps
 
 TOKEN = os.environ["BOT_TOKEN"]
 GROQ_KEY = os.environ["GROQ_API_KEY"]
@@ -33,6 +35,7 @@ CF_EDIT_API = (
 
 MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
+TTS_VOICE = "ru-RU-DmitryNeural"
 
 CHANNEL = "@VORTEX_RELAX"
 
@@ -132,6 +135,41 @@ def send_photo(chat_id, image_data, caption=""):
     return result
 
 
+def send_voice(chat_id, audio_data, caption=""):
+    boundary = "----VORTEX" + uuid.uuid4().hex
+
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        f"{chat_id}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="caption"\r\n\r\n'
+        f"{caption}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="voice"; filename="vortex.mp3"\r\n'
+        "Content-Type: audio/mpeg\r\n\r\n"
+    ).encode() + audio_data + (
+        f"\r\n--{boundary}--\r\n"
+    ).encode()
+
+    req = urllib.request.Request(
+        TG_API + "sendVoice",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
+    )
+
+    with urllib.request.urlopen(req, timeout=120) as response:
+        result = json.loads(response.read())
+
+    if not result.get("ok"):
+        raise Exception(str(result))
+
+    return result
+
+
 def download_telegram_file(file_id):
     info = tg_request("getFile", {"file_id": file_id})
 
@@ -143,6 +181,41 @@ def download_telegram_file(file_id):
 
     with urllib.request.urlopen(url, timeout=60) as response:
         return response.read()
+
+
+# =========================
+# ГОЛОСОВЫЕ ОТВЕТЫ
+# =========================
+
+def text_to_speech(text):
+    try:
+        import edge_tts
+
+        async def generate():
+            communicate = edge_tts.Communicate(
+                text,
+                TTS_VOICE
+            )
+
+            audio = bytearray()
+
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio.extend(chunk["data"])
+
+            return bytes(audio)
+
+        audio_data = asyncio.run(generate())
+
+        if not audio_data:
+            print("TTS returned empty audio")
+            return None
+
+        return audio_data
+
+    except Exception as error:
+        print("TTS error:", error)
+        return None
 
 
 # =========================
@@ -787,7 +860,6 @@ def edit_image(image_data, instruction):
 
         print("Original image:", image.format, image.size)
 
-        from PIL import ImageOps
         image = ImageOps.exif_transpose(image)
 
         if image.mode != "RGB":
@@ -1201,7 +1273,7 @@ def handle_message(message):
             "🎨 Создаю изображения по описанию\n"
             "🖼️ Редактирую фотографии по подписи\n"
             "🧠 Отвечаю на вопросы\n"
-            "🎙️ Распознаю голосовые сообщения\n"
+            "🎙️ Распознаю голосовые сообщения и отвечаю голосом\n"
             "🔥 Улучшаю и редактирую тексты\n\n"
             "Выбирай функцию в меню или просто напиши мне.\n\n"
             "VORTEX. Твои идеи. Мои возможности. ⚡",
@@ -1258,7 +1330,7 @@ def handle_message(message):
             "• Помощь с текстами\n"
             "• Ответы на вопросы\n"
             "• Разные стили написания\n"
-            "• 🎙️ Распознавание голосовых\n"
+            "• 🎙️ Распознавание голосовых и голосовые ответы\n"
             "• 🎨 Генерация изображений\n"
             "• 🖼️ Редактирование фотографий по подписи\n\n"
             "💎 Premium: 65 Stars за 30 дней.",
@@ -1491,7 +1563,7 @@ def handle_message(message):
         send_message(chat_id, answer, keyboard)
         return
 
-    # ОБЫЧНЫЙ ЧАТ
+    # ОБЫЧНЫЙ ЧАТ И ГОЛОСОВОЙ ОТВЕТ
     if not can_use_ai(chat_id):
         return
 
@@ -1500,7 +1572,32 @@ def handle_message(message):
     answer = ask_ai(chat_id, text)
 
     count_request(chat_id)
-    send_message(chat_id, answer, keyboard)
+
+    if is_voice:
+        send_message(chat_id, answer)
+
+        audio_data = text_to_speech(answer)
+
+        if audio_data:
+            try:
+                send_voice(chat_id, audio_data)
+            except Exception as error:
+                print("Voice sending error:", error)
+                send_message(
+                    chat_id,
+                    "❌ Не получилось отправить голосовой ответ. "
+                    "Ответ выше доступен текстом.",
+                    keyboard
+                )
+        else:
+            send_message(
+                chat_id,
+                "❌ Не получилось создать голосовой ответ. "
+                "Ответ выше доступен текстом.",
+                keyboard
+            )
+    else:
+        send_message(chat_id, answer, keyboard)
 
 
 # =========================
