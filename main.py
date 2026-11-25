@@ -904,34 +904,34 @@ def ask_ai(chat_id, prompt, max_tokens=TEXT_MAX_TOKENS):
 # =========================
 
 def prepare_image_prompt(user_idea):
+    """Уточняет визуальный запрос, не меняя главный объект и условия пользователя."""
     system_prompt = """
-You are VORTEX, an expert AI image prompt engineer.
+You are an image prompt writer. Translate the user's request into a clear,
+detailed English prompt for an image generator.
 
-Convert the user's idea into a detailed English image-generation prompt.
-
-The main object requested by the user MUST be the central
-and clearly visible subject.
-
-Preserve all requested objects, brands, models, colors,
-locations, actions, camera angles and artistic styles.
-
-Never replace the requested object with scenery.
-Do not invent important details.
-Describe the main subject first, then environment,
-lighting, camera and style.
-
-Do not add text, watermarks or logos unless requested.
-Return ONLY the final English prompt.
+STRICT RULES:
+- The exact subject named by the user is mandatory and must dominate the image.
+- Never replace, omit, or reinterpret a named vehicle, person, animal, object,
+  brand, or model. BMW means a BMW car, not a different car or a random scene.
+- Preserve every explicit scene condition such as night, rain, city, color,
+  location, camera angle, and style.
+- Add only visual details that support the user's request.
+- Put the requested main subject first and make it large, central, and clearly visible.
+- Do not add unrelated objects, text, watermarks, logos, or extra subjects.
+- Return only the final English image prompt.
 """
 
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_idea}
+            {"role": "user", "content": (
+                "Create a prompt for this exact request. Do not change its subject "
+                "or conditions. ORIGINAL USER REQUEST: " + user_idea
+            )}
         ],
-        "temperature": 0.4,
-        "max_completion_tokens": 500
+        "temperature": 0.1,
+        "max_completion_tokens": 350
     }
 
     req = urllib.request.Request(
@@ -947,18 +947,27 @@ Return ONLY the final English prompt.
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             result = json.loads(response.read())
-
         improved = result["choices"][0]["message"]["content"].strip()
-
         if improved:
+            # Исходный запрос всегда остаётся в промпте как жёсткое ограничение.
+            final_prompt = (
+                improved[:1600]
+                + "\n\nMANDATORY: Follow this original user request exactly: "
+                + user_idea[:400]
+                + ". The named subject and all stated conditions must be visible. "
+                  "Do not substitute another subject or scene."
+            )
             print("Original image idea:", user_idea)
-            print("Improved image prompt:", improved)
-            return improved[:2048]
-
+            print("Improved image prompt:", final_prompt)
+            return final_prompt[:2048]
     except Exception as error:
         print("Image prompt improvement error:", error)
 
-    return user_idea
+    return (
+        "Create an image showing exactly this scene: " + user_idea
+        + ". The named subject must be central, large, and clearly visible. "
+          "Do not replace it with anything else."
+    )[:2048]
 
 
 # =========================
@@ -1477,7 +1486,9 @@ def detect_intent(text):
         rf"\b{image_object}\b.*\b{image_action}\b",
         r"\b(?:нарис\w*|изобраз\w*|сгенериру\w*|созда\w*)\b",
         r"\b(?:хочу|нужна|нужно|сделай)\b.*\b(?:картин\w*|изображен\w*|фото\w*|фотограф\w*)\b",
-        r"\b(?:генерац\w*|создан\w*)\b.*\b(?:картин\w*|изображен\w*|фото\w*)\b"
+        r"\b(?:генерац\w*|создан\w*)\b.*\b(?:картин\w*|изображен\w*|фото\w*)\b",
+        # «Сделай BMW ночью», «сделай машину у моря» и похожие запросы.
+        r"\b(?:сделай|создай|нарисуй|изобрази|сгенерируй)\b.*\b(?:bmw|бмв|mercedes|мерседес|audi|ауди|машин\w*|автомобил\w*|мотоцикл\w*|кот\w*|собак\w*|человек\w*|робот\w*)\b"
     )
     if any(re.search(pattern, value) for pattern in image_patterns):
         return "image"
