@@ -856,55 +856,47 @@ def clean_ai_text(value):
 # =========================
 
 def decide_web_search(question):
-    """Определяет, нужны ли свежие данные из интернета, и формирует поисковый запрос."""
+    """Определяет необходимость веб-поиска без отдельного запроса к Groq."""
     if not FIRECRAWL_KEY:
         return None
 
-    classifier_prompt = (
-        "Определи, нужен ли для ответа свежий поиск в интернете. "
-        "Ищи, если вопрос о текущих/сегодняшних событиях, новостях, ценах, "
-        "наличии, курсах, погоде, расписаниях, новых версиях/моделях, "
-        "изменяющихся правилах или просит проверить актуальную информацию. "
-        "Не ищи для обычных знаний, советов, творчества, математики и беседы. "
-        "Верни строго JSON без Markdown: {\"search\":true/false,\"query\":\"короткий поисковый запрос\"}. "
-        "Если search=false, query оставь пустым. Вопрос: " + question[:1500]
+    text = str(question or "").strip()
+    if not text:
+        return None
+
+    # Явные просьбы найти или проверить информацию в интернете.
+    explicit_search = re.search(
+        r"\b(найди|поищи|загугли|проверь|посмотри|узнай|найти|поиск|источники|ссылки)\b"
+        r".{0,50}\b(интернет|сайт|сеть|актуальн|свеж|сейчас|сегодня|последн|цен|курс|новост|погод)",
+        text,
+        re.IGNORECASE | re.DOTALL
     )
-    payload = {
-        "model": MODEL,
-        "messages": [{"role": "user", "content": classifier_prompt}],
-        "temperature": 0,
-        "max_completion_tokens": 100
-    }
-    req = urllib.request.Request(
-        GROQ_API,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_KEY}",
-            "User-Agent": "VORTEX-Bot/1.0"
-        }
+    direct_web_request = re.search(
+        r"\b(найди в интернете|поищи в интернете|проверь в интернете|посмотри в интернете|"
+        r"найди информацию|покажи источники|дай ссылки|последние новости)\b",
+        text,
+        re.IGNORECASE
     )
-    try:
-        with urllib.request.urlopen(req, timeout=25) as response:
-            result = json.loads(response.read())
-        raw = result["choices"][0]["message"]["content"].strip()
-        match = re.search(r"\{[\s\S]*\}", raw)
-        if not match:
-            print("[WEB SEARCH] Classifier returned non-JSON:", raw[:1000])
-            return None
-        decision = json.loads(match.group(0))
-        if decision.get("search") and str(decision.get("query", "")).strip():
-            return str(decision["query"]).strip()[:300]
-    except urllib.error.HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
-        print(
-            "[WEB SEARCH] Groq classifier HTTP error:",
-            error.code,
-            details[:2000]
-        )
-    except Exception as error:
-        print("[WEB SEARCH] Intent detection error:", repr(error))
-    return None
+
+    # Темы, для которых данные быстро меняются.
+    current_info = re.search(
+        r"\b(сегодня|сейчас|на данный момент|прямо сейчас|актуальн\w*|последн\w*|"
+        r"свеж\w*|текущ\w*|в этом году|в этом месяце|завтра|на этой неделе|"
+        r"новости|курс валют|курс доллара|курс евро|погода|температур\w*|"
+        r"цена|стоимость|сколько стоит|в наличии|расписание|рейс|афиша|"
+        r"результаты матч\w*|кто выиграл|выборы|закон вступил|обновлени\w*|"
+        r"новая модель|последняя версия|открыт ли|работает ли сегодня)\b",
+        text,
+        re.IGNORECASE
+    )
+
+    if not (explicit_search or direct_web_request or current_info):
+        return None
+
+    # Сам вопрос уже является хорошим поисковым запросом.
+    query = re.sub(r"\s+", " ", text).strip()
+    query = re.sub(r"^(найди|поищи|загугли|проверь|посмотри|узнай)\s+", "", query, flags=re.IGNORECASE)
+    return query[:300] or None
 
 
 def search_web(query):
