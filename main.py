@@ -39,7 +39,7 @@ CF_EDIT_API = (
 
 MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+VISION_MODEL = "qwen/qwen3.8-27b"
 
 PIPER_VOICE = "ru_RU-ruslan-medium"
 PIPER_DIR = os.path.join(os.getcwd(), "piper_voices")
@@ -1417,10 +1417,16 @@ def transcribe_audio_bytes(audio_data, filename="circle.mp3", content_type="audi
     req = urllib.request.Request(
         GROQ_AUDIO_API, data=body,
         headers={"Authorization": f"Bearer {GROQ_KEY}",
-                 "Content-Type": f"multipart/form-data; boundary={boundary}"}
+                 "Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "User-Agent": "VORTEX-Bot/1.0"}
     )
-    with urllib.request.urlopen(req, timeout=120) as response:
-        result = json.loads(response.read())
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        details = error.read().decode(errors="ignore")
+        print("[VIDEO NOTE] Whisper HTTP error:", error.code, details[:3000])
+        raise
     return result.get("text", "").strip()
 
 
