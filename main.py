@@ -69,6 +69,26 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+LAST_IMAGES_DIR = os.path.join(DATA_DIR, "last_images")
+os.makedirs(LAST_IMAGES_DIR, exist_ok=True)
+
+def last_image_path(chat_id):
+    return os.path.join(LAST_IMAGES_DIR, f"{chat_id}.jpg")
+
+def save_last_image(chat_id, image_data):
+    """Сохраняет последнее созданное/отредактированное изображение чата."""
+    path = last_image_path(chat_id)
+    temp_path = path + ".tmp"
+    with open(temp_path, "wb") as image_file:
+        image_file.write(image_data)
+    os.replace(temp_path, path)
+
+def load_last_image(chat_id):
+    path = last_image_path(chat_id)
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as image_file:
+        return image_file.read()
 
 keyboard = {
     "keyboard": [
@@ -1334,6 +1354,7 @@ def handle_photo_edit(message):
             send_message(chat_id, error_text, keyboard)
             return
 
+        save_last_image(chat_id, edited)
         send_photo(
             chat_id,
             edited,
@@ -1472,6 +1493,49 @@ def handle_callback(callback):
 # =========================
 # ОБРАБОТКА СООБЩЕНИЙ
 # =========================
+
+def is_image_edit_request(text):
+    """Проверяет, просит ли пользователь изменить уже созданное фото."""
+    value = text.lower().strip().replace("ё", "е")
+    edit_words = (
+        r"\b(?:измени|изменить|переделай|переделать|исправь|исправить|"
+        r"отредактируй|отредактировать|добавь|добавить|убери|убрать|"
+        r"замени|заменить|сделай\s+иначе|поменяй|поменять|"
+        r"покрась|перекрась|перекрасить|сделай\s+фон)\b"
+    )
+    return bool(re.search(edit_words, value))
+
+
+def handle_last_image_edit(chat_id, instruction):
+    if not can_use_ai(chat_id):
+        return True
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        send_message(chat_id, "Редактирование не настроено. Проверь Cloudflare в Railway.")
+        return True
+    original = load_last_image(chat_id)
+    if not original:
+        return False
+
+    send_message(chat_id, "Понял. Изменяю последнее изображение, сохраняя остальное без изменений...")
+    edited, error_type = edit_image(original, instruction)
+    if not edited:
+        if error_type == "blocked":
+            send_message(chat_id, "Cloudflare не разрешил это изменение. Попробуй сформулировать запрос иначе.")
+        elif error_type == "configuration":
+            send_message(chat_id, "Не настроено подключение к Cloudflare. Проверь переменные Railway.")
+        else:
+            send_message(chat_id, "Не получилось изменить изображение. Попробуй ещё раз.")
+        return True
+
+    try:
+        save_last_image(chat_id, edited)
+        send_photo(chat_id, edited, "Готово. Это обновлённая версия изображения.")
+        count_request(chat_id)
+    except Exception as error:
+        print("Last image edit send error:", error)
+        send_message(chat_id, "Изменение готово, но Telegram не смог отправить фото.")
+    return True
+
 
 def detect_intent(text):
     """Распознаёт намерение пользователя по обычной русской формулировке."""
@@ -1624,6 +1688,11 @@ def handle_message(message):
             "Просто напиши задачу обычными словами.")
         return
 
+    # Если пользователь просит изменить последнее созданное фото, используем его без повторной отправки.
+    if is_image_edit_request(text) and load_last_image(chat_id):
+        if handle_last_image_edit(chat_id, text):
+            return
+
     # Старые незавершённые сценарии не должны перехватывать новые сообщения.
     user_states.pop(chat_id, None)
 
@@ -1653,7 +1722,8 @@ def handle_message(message):
             send_message(chat_id, "❌ Не удалось создать изображение. Возможно, временно недоступен Cloudflare или закончилась квота. Попробуй позже.")
             return
         try:
-            send_photo(chat_id, image_data, "⚡ Создано с помощью VORTEX")
+            save_last_image(chat_id, image_data)
+            send_photo(chat_id, image_data, "Создано с помощью VORTEX")
             count_request(chat_id)
         except Exception as error:
             print("Telegram sendPhoto error:", error)
