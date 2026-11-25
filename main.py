@@ -11,6 +11,7 @@ import tempfile
 import wave
 import urllib.request
 import urllib.error
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageOps
 
@@ -78,7 +79,7 @@ style_keyboard = {
 # =========================
 
 def tg_request(method, data=None):
-    body = urllib.parse.urlencode(data or {}).encode()
+    body = urlencode(data or {}).encode()
 
     req = urllib.request.Request(
         TG_API + method,
@@ -1292,11 +1293,10 @@ def handle_message(message):
     text = message.get("text", "").strip()
     is_voice = bool(message.get("voice"))
 
+    # Голосовое распознаём без промежуточных текстовых сообщений
     if is_voice:
         if not can_use_ai(chat_id):
             return
-
-        send_message(chat_id, "🎙️ VORTEX слушает тебя...")
 
         recognized_text = transcribe_voice(
             message["voice"]["file_id"]
@@ -1312,11 +1312,6 @@ def handle_message(message):
             return
 
         text = recognized_text
-
-        send_message(
-            chat_id,
-            f"📝 Я услышал:\n\n{text}\n\n⚡ Обрабатываю..."
-        )
 
     if not text:
         return
@@ -1615,15 +1610,17 @@ def handle_message(message):
     if not can_use_ai(chat_id):
         return
 
-    send_message(chat_id, "⚡ Думаю над ответом...")
+    # Для текста оставляем привычное сообщение о процессе.
+    # Для голосового никаких промежуточных сообщений не отправляем.
+    if not is_voice:
+        send_message(chat_id, "⚡ Думаю над ответом...")
 
     answer = ask_ai(chat_id, text)
 
     count_request(chat_id)
 
     if is_voice:
-        send_message(chat_id, answer)
-
+        # Голосовое на входе = только голосовое на выходе.
         audio_data = text_to_speech(answer)
 
         if audio_data:
@@ -1634,17 +1631,18 @@ def handle_message(message):
                 send_message(
                     chat_id,
                     "❌ Не получилось отправить голосовой ответ. "
-                    "Ответ выше доступен текстом.",
+                    "Попробуй ещё раз.",
                     keyboard
                 )
         else:
             send_message(
                 chat_id,
                 "❌ Не получилось создать голосовой ответ. "
-                "Ответ выше доступен текстом.",
+                "Попробуй ещё раз.",
                 keyboard
             )
     else:
+        # Текст на входе = только текст на выходе.
         send_message(chat_id, answer, keyboard)
 
 
