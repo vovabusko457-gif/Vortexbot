@@ -16,12 +16,18 @@ CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 
 TG_API = f"https://api.telegram.org/bot{TOKEN}/"
+TG_FILE_API = f"https://api.telegram.org/file/bot{TOKEN}/"
 GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
 
 CF_IMAGE_API = (
     f"https://api.cloudflare.com/client/v4/accounts/"
     f"{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+)
+
+CF_EDIT_API = (
+    f"https://api.cloudflare.com/client/v4/accounts/"
+    f"{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-2-klein-4b"
 )
 
 MODEL = "openai/gpt-oss-20b"
@@ -123,6 +129,19 @@ def send_photo(chat_id, image_data, caption=""):
         raise Exception(str(result))
 
     return result
+
+
+def download_telegram_file(file_id):
+    info = tg_request("getFile", {"file_id": file_id})
+
+    if not info.get("ok"):
+        raise Exception("Telegram не смог получить файл")
+
+    file_path = info["result"]["file_path"]
+    url = TG_FILE_API + file_path
+
+    with urllib.request.urlopen(url, timeout=60) as response:
+        return response.read()
 
 
 # =========================
@@ -563,7 +582,7 @@ def ask_ai(chat_id, prompt):
 
 
 # =========================
-# УМНОЕ ПОНИМАНИЕ ЗАПРОСОВ ДЛЯ КАРТИНОК
+# УМНЫЙ ПРОМПТ ДЛЯ ГЕНЕРАЦИИ
 # =========================
 
 def prepare_image_prompt(user_idea):
@@ -572,59 +591,26 @@ You are VORTEX, an expert AI image prompt engineer.
 
 Convert the user's idea into a detailed English image-generation prompt.
 
-The goal is to visualize exactly what the user imagines.
+The main object requested by the user MUST be the central
+and clearly visible subject.
 
-STRICT RULES:
+Preserve all requested objects, brands, models, colors,
+locations, actions, camera angles and artistic styles.
 
-1. The main object requested by the user MUST be the
-   central and clearly visible subject of the image.
+Never replace the requested object with scenery.
+Do not invent important details.
+Describe the main subject first, then environment,
+lighting, camera and style.
 
-2. NEVER replace the requested object with scenery,
-   sky, background or unrelated objects.
-
-3. Preserve every explicitly requested detail:
-   objects, brands, models, colors, locations, actions,
-   camera angles, atmosphere and artistic style.
-
-4. If the user gives a short idea, intelligently add
-   suitable visual details, composition, lighting,
-   environment and camera perspective.
-
-5. Never contradict the user's idea.
-
-6. Do not invent a specific car model, color, brand
-   variant or other important detail if it was not specified.
-
-7. Describe the main subject FIRST.
-   Describe the environment SECOND.
-   Describe lighting, camera and style THIRD.
-
-8. The main subject must occupy a significant part
-   of the image and be easy to recognize.
-
-9. Avoid irrelevant scenery and empty backgrounds.
-
-10. Do not add text, watermarks, captions or logos
-    unless explicitly requested.
-
-11. If the user requests a realistic image,
-    use photorealistic photography language.
-
-12. Return ONLY the final English prompt.
-    No explanations, no introductions.
+Do not add text, watermarks or logos unless requested.
+Return ONLY the final English prompt.
 """
 
     payload = {
         "model": MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_idea
-            }
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_idea}
         ],
         "temperature": 0.4,
         "max_completion_tokens": 500
@@ -644,30 +630,21 @@ STRICT RULES:
         with urllib.request.urlopen(req, timeout=60) as response:
             result = json.loads(response.read())
 
-        improved = (
-            result["choices"][0]["message"]["content"].strip()
-        )
+        improved = result["choices"][0]["message"]["content"].strip()
 
-        if not improved:
-            return user_idea
-
-        print("Original image idea:", user_idea)
-        print("Improved image prompt:", improved)
-
-        return improved[:2048]
-
-    except urllib.error.HTTPError as error:
-        details = error.read().decode(errors="ignore")
-        print("Image prompt Groq HTTP error:", error.code, details)
-        return user_idea
+        if improved:
+            print("Original image idea:", user_idea)
+            print("Improved image prompt:", improved)
+            return improved[:2048]
 
     except Exception as error:
         print("Image prompt improvement error:", error)
-        return user_idea
+
+    return user_idea
 
 
 # =========================
-# ГЕНЕРАЦИЯ КАРТИНОК CLOUDFLARE
+# ОБЫЧНАЯ ГЕНЕРАЦИЯ КАРТИНОК
 # =========================
 
 def generate_image(prompt):
@@ -675,16 +652,8 @@ def generate_image(prompt):
         print("Cloudflare credentials are missing")
         return None
 
-    # Этап 1. Groq превращает задумку в подробный промпт
-    original_prompt = prompt
-    prompt = prepare_image_prompt(original_prompt)
+    prompt = prepare_image_prompt(prompt)
 
-    if len(prompt) > 2048:
-        prompt = prompt[:2048]
-
-    print("Final Flux prompt:", prompt)
-
-    # Этап 2. Flux создаёт изображение
     payload = {
         "prompt": prompt,
         "steps": 4
@@ -705,7 +674,7 @@ def generate_image(prompt):
             result = json.loads(response.read())
 
         if not result.get("success", False):
-            print("Cloudflare API error:", result)
+            print("Cloudflare generation error:", result)
             return None
 
         image_base64 = result.get("result", {}).get("image")
@@ -715,22 +684,262 @@ def generate_image(prompt):
             print(result)
             return None
 
-        image_data = base64.b64decode(image_base64)
-
-        if not image_data:
-            print("Generated image is empty")
-            return None
-
-        return image_data
+        return base64.b64decode(image_base64)
 
     except urllib.error.HTTPError as error:
-        details = error.read().decode(errors="ignore")
-        print("Cloudflare HTTP error:", error.code, details)
+        print(
+            "Cloudflare generation HTTP error:",
+            error.code,
+            error.read().decode(errors="ignore")
+        )
         return None
 
     except Exception as error:
-        print("Cloudflare image error:", error)
+        print("Cloudflare generation error:", error)
         return None
+
+
+# =========================
+# РЕДАКТИРОВАНИЕ ФОТО
+# =========================
+
+def prepare_edit_prompt(user_instruction):
+    system_prompt = """
+You are an expert image editing instruction translator.
+
+Translate the user's image editing instruction into a clear,
+detailed English instruction for an image editing AI.
+
+The AI will receive the original image separately.
+
+IMPORTANT:
+- Edit the existing image, do not create an unrelated new scene.
+- Preserve the original subject, identity, composition and perspective.
+- Change only what the user explicitly requests.
+- Keep all unrelated objects and details unchanged.
+- For color changes, change the requested object's color only.
+- Do not add text, watermarks or logos unless requested.
+- Return only the final English editing instruction.
+"""
+
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_instruction}
+        ],
+        "temperature": 0.3,
+        "max_completion_tokens": 400
+    }
+
+    req = urllib.request.Request(
+        GROQ_API,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_KEY}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read())
+
+        prompt = result["choices"][0]["message"]["content"].strip()
+
+        if prompt:
+            return prompt[:1500]
+
+    except Exception as error:
+        print("Edit prompt error:", error)
+
+    return (
+        "Edit the provided image according to this instruction: "
+        + user_instruction
+    )
+
+
+def edit_image(image_data, instruction):
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        print("Cloudflare credentials are missing")
+        return None
+
+    prompt = prepare_edit_prompt(instruction)
+
+    boundary = "----VORTEX" + uuid.uuid4().hex
+
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+        f"{prompt}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="input_image_0"; '
+        'filename="input.jpg"\r\n'
+        "Content-Type: image/jpeg\r\n\r\n"
+    ).encode() + image_data + (
+        f"\r\n--{boundary}\r\n"
+        'Content-Disposition: form-data; name="width"\r\n\r\n'
+        "1024\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="height"\r\n\r\n'
+        "1024\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+
+    req = urllib.request.Request(
+        CF_EDIT_API,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Authorization": f"Bearer {CF_API_TOKEN}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
+    )
+
+    try:
+        print("Starting image edit...")
+        print("Edit instruction:", prompt)
+
+        with urllib.request.urlopen(req, timeout=240) as response:
+            result = json.loads(response.read())
+
+        if not result.get("success", False):
+            print("Cloudflare edit error:", result)
+            return None
+
+        image_base64 = result.get("result", {}).get("image")
+
+        if not image_base64:
+            print("Cloudflare edit returned no image:", result)
+            return None
+
+        edited_data = base64.b64decode(image_base64)
+
+        if not edited_data:
+            print("Edited image is empty")
+            return None
+
+        return edited_data
+
+    except urllib.error.HTTPError as error:
+        details = error.read().decode(errors="ignore")
+        print("Cloudflare edit HTTP error:", error.code, details)
+        return None
+
+    except Exception as error:
+        print("Cloudflare edit error:", error)
+        return None
+
+
+# =========================
+# ОБРАБОТКА ФОТО С ПОДПИСЬЮ
+# =========================
+
+def handle_photo_edit(message):
+    chat_id = message["chat"]["id"]
+    caption = message.get("caption", "").strip()
+
+    if not caption:
+        send_message(
+            chat_id,
+            "✍️ Напиши, что нужно изменить, прямо в подписи к фотографии.\n\n"
+            "Например: «Сделай машину красной, сохрани фон и освещение»."
+        )
+        return
+
+    if not can_use_ai(chat_id):
+        return
+
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        send_message(
+            chat_id,
+            "❌ Редактирование не настроено. Проверь Cloudflare в Railway.",
+            keyboard
+        )
+        return
+
+    if len(caption) > 1500:
+        send_message(chat_id, "❌ Слишком длинная команда. Сократи её до 1500 символов.")
+        return
+
+    photos = message.get("photo", [])
+
+    if not photos:
+        return
+
+    # Telegram обычно присылает несколько размеров.
+    # Берём самый большой вариант, который укладывается в лимит 512x512.
+    suitable = [
+        photo for photo in photos
+        if photo.get("width", 9999) < 512
+        and photo.get("height", 9999) < 512
+    ]
+
+    if suitable:
+        selected_photo = max(
+            suitable,
+            key=lambda item: item.get("file_size", 0)
+        )
+    else:
+        # Если подходящего размера нет, берём самый маленький.
+        selected_photo = min(
+            photos,
+            key=lambda item: (
+                item.get("width", 9999) *
+                item.get("height", 9999)
+            )
+        )
+
+    send_message(
+        chat_id,
+        "🎨 VORTEX получил фотографию и команду.\n\n"
+        "Сейчас попробую изменить изображение. Это может занять некоторое время."
+    )
+
+    try:
+        image_data = download_telegram_file(selected_photo["file_id"])
+
+        if not image_data:
+            send_message(chat_id, "❌ Не удалось загрузить фотографию из Telegram.")
+            return
+
+        print(
+            "Photo received:",
+            selected_photo.get("width"),
+            selected_photo.get("height"),
+            "bytes:",
+            len(image_data)
+        )
+
+        edited = edit_image(image_data, caption)
+
+        if not edited:
+            send_message(
+                chat_id,
+                "❌ Не удалось отредактировать фото.\n\n"
+                "Проверь логи Railway. Возможно, Cloudflare отклонил "
+                "размер или формат изображения.",
+                keyboard
+            )
+            return
+
+        send_photo(
+            chat_id,
+            edited,
+            "⚡ Фото отредактировано с помощью VORTEX"
+        )
+
+        count_request(chat_id)
+
+    except Exception as error:
+        print("Photo editing handler error:", error)
+        send_message(
+            chat_id,
+            "❌ Произошла ошибка при обработке фотографии.\n"
+            "Попробуй ещё раз.",
+            keyboard
+        )
 
 
 # =========================
@@ -739,39 +948,14 @@ def generate_image(prompt):
 
 def transcribe_voice(file_id):
     try:
-        file_info = tg_request("getFile", {
-            "file_id": file_id
-        })
-
-        if not file_info.get("ok"):
-            print("Telegram getFile error:", file_info)
-            return None
-
-        file_path = file_info["result"]["file_path"]
-
-        download_url = (
-            f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-        )
-
-        with urllib.request.urlopen(download_url, timeout=60) as response:
-            audio_data = response.read()
+        audio_data = download_telegram_file(file_id)
 
         if not audio_data:
-            print("Empty audio file")
             return None
 
         if len(audio_data) > 20 * 1024 * 1024:
             print("Audio file is too large")
             return None
-
-        print(
-            "Voice file:",
-            file_path,
-            "Size:",
-            len(audio_data),
-            "Signature:",
-            audio_data[:4]
-        )
 
         if audio_data[:4] != b"OggS":
             print("Audio is not an OGG file")
@@ -805,15 +989,14 @@ def transcribe_voice(file_id):
 
         recognized = result.get("text", "").strip()
 
-        if not recognized:
-            print("Whisper returned empty transcription")
-            return None
-
-        return recognized
+        return recognized or None
 
     except urllib.error.HTTPError as error:
-        details = error.read().decode(errors="ignore")
-        print("Whisper HTTP error:", error.code, details)
+        print(
+            "Whisper HTTP error:",
+            error.code,
+            error.read().decode(errors="ignore")
+        )
         return None
 
     except Exception as error:
@@ -880,6 +1063,11 @@ def handle_message(message):
         activate_premium(message)
         return
 
+    # ФОТО С ПОДПИСЬЮ: один запрос, одно сообщение
+    if message.get("photo"):
+        handle_photo_edit(message)
+        return
+
     text = message.get("text", "").strip()
     is_voice = bool(message.get("voice"))
 
@@ -926,6 +1114,7 @@ def handle_message(message):
             "✍️ Создаю посты для соцсетей\n"
             "💡 Генерирую идеи для контента\n"
             "🎨 Создаю изображения по описанию\n"
+            "🖼️ Редактирую фотографии по подписи\n"
             "🧠 Отвечаю на вопросы\n"
             "🎙️ Распознаю голосовые сообщения\n"
             "🔥 Улучшаю и редактирую тексты\n\n"
@@ -985,7 +1174,8 @@ def handle_message(message):
             "• Ответы на вопросы\n"
             "• Разные стили написания\n"
             "• 🎙️ Распознавание голосовых\n"
-            "• 🎨 Генерация изображений\n\n"
+            "• 🎨 Генерация изображений\n"
+            "• 🖼️ Редактирование фотографий по подписи\n\n"
             "💎 Premium: 65 Stars за 30 дней.",
             keyboard
         )
@@ -993,9 +1183,7 @@ def handle_message(message):
 
     # СОЗДАНИЕ ПОСТА
     if text == "✍️ Создать пост":
-        user_states[chat_id] = {
-            "step": "topic"
-        }
+        user_states[chat_id] = {"step": "topic"}
 
         send_message(
             chat_id,
@@ -1010,9 +1198,7 @@ def handle_message(message):
 
     # ГЕНЕРАЦИЯ КАРТИНОК
     if text == "🎨 Создать картинку":
-        user_states[chat_id] = {
-            "step": "image_prompt"
-        }
+        user_states[chat_id] = {"step": "image_prompt"}
 
         send_message(
             chat_id,
@@ -1031,9 +1217,7 @@ def handle_message(message):
 
     # ИДЕИ ДЛЯ КОНТЕНТА
     if text == "💡 Идеи для контента":
-        user_states[chat_id] = {
-            "step": "ideas"
-        }
+        user_states[chat_id] = {"step": "ideas"}
 
         send_message(
             chat_id,
@@ -1117,7 +1301,7 @@ def handle_message(message):
         send_message(
             chat_id,
             "🎨 VORTEX анализирует твою задумку и создаёт изображение...\n\n"
-            "Сначала я продумываю сцену, затем рисую её. Это займёт немного времени."
+            "Сначала я продумываю сцену, затем рисую её."
         )
 
         image_data = generate_image(text)
@@ -1139,7 +1323,6 @@ def handle_message(message):
                 image_data,
                 "⚡ Создано с помощью VORTEX"
             )
-
             count_request(chat_id)
 
         except Exception as error:
@@ -1249,8 +1432,9 @@ def main():
 
     if CF_ACCOUNT_ID and CF_API_TOKEN:
         print("Cloudflare Image API настроен.")
+        print("Cloudflare Image Editing API настроен.")
     else:
-        print("ВНИМАНИЕ: Cloudflare Image API не настроен.")
+        print("ВНИМАНИЕ: Cloudflare API не настроен.")
 
     try:
         tg_request("deleteWebhook", {
