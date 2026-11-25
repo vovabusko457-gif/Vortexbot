@@ -190,20 +190,28 @@ def download_telegram_file(file_id):
 def text_to_speech(text):
     try:
         import edge_tts
+        import tempfile
 
         async def generate():
             communicate = edge_tts.Communicate(
-                text,
-                TTS_VOICE
+                text=text,
+                voice=TTS_VOICE
             )
 
-            audio = bytearray()
+            with tempfile.NamedTemporaryFile(
+                suffix=".mp3",
+                delete=False
+            ) as file:
+                path = file.name
 
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio.extend(chunk["data"])
+            try:
+                await communicate.save(path)
 
-            return bytes(audio)
+                with open(path, "rb") as audio:
+                    return audio.read()
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
 
         audio_data = asyncio.run(generate())
 
@@ -211,10 +219,11 @@ def text_to_speech(text):
             print("TTS returned empty audio")
             return None
 
+        print("TTS audio generated:", len(audio_data), "bytes")
         return audio_data
 
     except Exception as error:
-        print("TTS error:", error)
+        print("TTS error:", repr(error))
         return None
 
 
