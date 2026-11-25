@@ -1,9 +1,11 @@
 
 import os
 import json
+import time
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode
+from datetime import datetime, timedelta, timezone
 
 TOKEN = os.environ["BOT_TOKEN"]
 GROQ_KEY = os.environ["GROQ_API_KEY"]
@@ -12,8 +14,14 @@ TG_API = f"https://api.telegram.org/bot{TOKEN}/"
 GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "openai/gpt-oss-20b"
 
+CHANNEL = "@VORTEX_RELAX"
+FREE_REQUESTS = 5
+TRIAL_DAYS = 7
+PRICE = 99
+
 user_states = {}
 chat_histories = {}
+users = {}
 
 keyboard = {
     "keyboard": [
@@ -42,10 +50,7 @@ def tg_request(method, data=None):
 
 
 def send_message(chat_id, text, menu=None):
-    data = {
-        "chat_id": chat_id,
-        "text": text
-    }
+    data = {"chat_id": chat_id, "text": text}
 
     if menu:
         data["reply_markup"] = json.dumps(
@@ -53,6 +58,7 @@ def send_message(chat_id, text, menu=None):
         )
 
     tg_request("sendMessage", data)
+
 
 def save_history():
     with open("history.json", "w", encoding="utf-8") as file:
@@ -68,7 +74,148 @@ def load_history():
                 for key, value in json.load(file).items()
             }
     except (FileNotFoundError, json.JSONDecodeError):
-            chat_histories = {}
+        chat_histories = {}
+
+
+def save_users():
+    with open("users.json", "w", encoding="utf-8") as file:
+        json.dump(users, file, ensure_ascii=False)
+
+
+def load_users():
+    global users
+    try:
+        with open("users.json", "r", encoding="utf-8") as file:
+            users = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        users = {}
+
+
+def get_user(chat_id):
+    key = str(chat_id)
+
+    if key not in users:
+        users[key] = {
+            "requests": 0,
+            "trial_until": None,
+            "paid_until": None
+        }
+        save_users()
+
+    return users[key]
+
+
+def is_subscribed(chat_id):
+    try:
+        result = tg_request("getChatMember", {
+            "chat_id": CHANNEL,
+            "user_id": chat_id
+        })
+
+        member = result.get("result", {})
+        status = member.get("status")
+
+        return (
+            status in ["creator", "administrator", "member"]
+            or (
+                status == "restricted"
+                and member.get("is_member", False)
+            )
+        )
+
+    except Exception as error:
+        print("Subscription check error:", error)
+        return False
+
+
+def subscription_message(chat_id):
+    menu = {
+        "inline_keyboard": [
+            [{
+                "text": "📢 Подписаться на канал",
+                "url": "https://t.me/VORTEX_RELAX"
+            }],
+            [{
+                "text": "✅ Проверить подписку",
+                "callback_data": "check_subscription"
+            }]
+        ]
+    }
+
+    send_message(
+        chat_id,
+        "⚡ VORTEX\n\n"
+        "Твои 5 бесплатных запросов закончились!\n\n"
+        "Подпишись на наш канал, чтобы получить "
+        "7 дней бесплатного доступа.",
+        menu
+    )
+
+
+def payment_message(chat_id):
+    send_message(
+        chat_id,
+        "⚡ VORTEX PREMIUM\n\n"
+        "Твой бесплатный период закончился.\n\n"
+        "Стоимость доступа: 99 ₽ / 30 дней.\n\n"
+        "Скоро здесь появится возможность оплаты.\n"
+        "Пока платная подписка ещё не подключена."
+    )
+
+
+def check_access(chat_id):
+    user = get_user(chat_id)
+
+    paid_until = user.get("paid_until")
+    trial_until = user.get("trial_until")
+
+    now = datetime.now(timezone.utc)
+
+    if paid_until:
+        if now < datetime.fromisoformat(paid_until):
+            return "paid"
+
+    if trial_until:
+        if now < datetime.fromisoformat(trial_until):
+            if is_subscribed(chat_id):
+                return "trial"
+
+            return "channel"
+
+        return "expired"
+
+    if user["requests"] < FREE_REQUESTS:
+        return "free"
+
+    return "channel"
+
+
+def can_use_ai(chat_id):
+    access = check_access(chat_id)
+
+    if access == "free":
+        return True
+
+    if access in ["trial", "paid"]:
+        return True
+
+    if access == "channel":
+        subscription_message(chat_id)
+        return False
+
+    if access == "expired":
+        payment_message(chat_id)
+        return False
+
+    return False
+
+
+def count_request(chat_id):
+    user = get_user(chat_id)
+
+    if not user.get("trial_until") and not user.get("paid_until"):
+        user["requests"] += 1
+        save_users()
 
 
 def ask_ai(chat_id, prompt):
@@ -89,10 +236,7 @@ def ask_ai(chat_id, prompt):
     ]
 
     messages.extend(history[-8:])
-    messages.append({
-        "role": "user",
-        "content": prompt
-    })
+    messages.append({"role": "user", "content": prompt})
 
     payload = {
         "model": MODEL,
@@ -105,10 +249,10 @@ def ask_ai(chat_id, prompt):
         GROQ_API,
         data=json.dumps(payload).encode(),
         headers={
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {GROQ_KEY}",
-    "User-Agent": "VORTEX/1.0"
-}
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_KEY}",
+            "User-Agent": "VORTEX/1.0"
+        }
     )
 
     try:
@@ -119,20 +263,68 @@ def ask_ai(chat_id, prompt):
 
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": answer})
+
         chat_histories[chat_id] = history[-10:]
         save_history()
+
         return answer.strip()
 
     except urllib.error.HTTPError as error:
         details = error.read().decode(errors="ignore")
         print("Groq HTTP error:", error.code, details)
+
         if error.code == 429:
-            return "Сейчас превышен бесплатный лимит ИИ. Попробуй немного позже."
-        return "Не получилось получить ответ от ИИ. Попробуй ещё раз."
+            return "Превышен бесплатный лимит ИИ. Попробуй позже."
+
+        return "Не получилось получить ответ от ИИ."
 
     except Exception as error:
         print("Groq error:", error)
         return "Что-то пошло не так. Попробуй ещё раз."
+
+
+def handle_callback(callback):
+    chat_id = callback["message"]["chat"]["id"]
+    callback_id = callback["id"]
+
+    tg_request("answerCallbackQuery", {
+        "callback_query_id": callback_id
+    })
+
+    if callback.get("data") != "check_subscription":
+        return
+
+    if not is_subscribed(chat_id):
+        send_message(
+            chat_id,
+            "❌ Подписка пока не найдена.\n"
+            "Подпишись на канал и нажми проверку ещё раз."
+        )
+        return
+
+    user = get_user(chat_id)
+
+    if not user.get("trial_until"):
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(days=TRIAL_DAYS)
+
+        user["trial_until"] = end.isoformat()
+        save_users()
+
+        send_message(
+            chat_id,
+            "🎉 Подписка подтверждена!\n\n"
+            "Тебе начислено 7 дней бесплатного доступа.\n"
+            "Приятного пользования VORTEX!",
+            keyboard
+        )
+    else:
+        send_message(
+            chat_id,
+            "✅ Подписка подтверждена!\n"
+            "Можешь продолжать пользоваться VORTEX.",
+            keyboard
+        )
 
 
 def handle_message(message):
@@ -144,10 +336,13 @@ def handle_message(message):
 
     if text == "/start":
         user_states.pop(chat_id, None)
-        
+
+        get_user(chat_id)
+
         send_message(
             chat_id,
-            "⚡ VORTEX\n\nТвой ИИ-помощник.\n\n"
+            "⚡ VORTEX\n\n"
+            "Твой ИИ-помощник.\n\n"
             "Создавай посты, придумывай идеи "
             "и задавай любые вопросы.",
             keyboard
@@ -174,6 +369,7 @@ def handle_message(message):
 
     if text == "✍️ Создать пост":
         user_states[chat_id] = {"step": "topic"}
+
         send_message(
             chat_id,
             "✍️ На какую тему создаём пост?\n\n"
@@ -185,21 +381,34 @@ def handle_message(message):
 
     if text == "💡 Идеи для контента":
         user_states[chat_id] = {"step": "ideas"}
+
         send_message(
             chat_id,
             "💡 Для какой ниши нужны идеи?\n\n"
-            "Например: магазин одежды, техника, "
-            "спорт, личный блог.",
+            "Например: магазин одежды, техника, спорт.",
             {"keyboard": [[{"text": "❌ Отмена"}]],
              "resize_keyboard": True}
         )
         return
 
     if text == "👤 Мой профиль":
+        user = get_user(chat_id)
+        access = check_access(chat_id)
+
+        if access == "free":
+            status = f"Бесплатные запросы: {user['requests']}/{FREE_REQUESTS}"
+        elif access == "trial":
+            status = "Статус: 7 дней бесплатного доступа"
+        elif access == "paid":
+            status = "Статус: PREMIUM"
+        elif access == "expired":
+            status = "Статус: доступ закончился"
+        else:
+            status = "Статус: требуется подписка на канал"
+
         send_message(
             chat_id,
-            f"👤 Твой профиль\nID: {chat_id}\n\n"
-            "Ты пользуешься VORTEX.",
+            f"👤 Твой профиль\nID: {chat_id}\n\n{status}",
             keyboard
         )
         return
@@ -211,6 +420,7 @@ def handle_message(message):
             "step": "style",
             "topic": text
         }
+
         send_message(
             chat_id,
             "Выбери стиль будущего поста:",
@@ -233,6 +443,11 @@ def handle_message(message):
             )
             return
 
+        if not can_use_ai(chat_id):
+            return
+
+        count_request(chat_id)
+
         topic = state["topic"]
         style = styles[text]
         user_states.pop(chat_id, None)
@@ -242,24 +457,35 @@ def handle_message(message):
         answer = ask_ai(
             chat_id,
             f"Создай готовый пост на тему: {topic}. "
-            f"Стиль: {style}. Добавь цепляющий заголовок, "
-            "основной текст и призыв к действию. "
-            "Не добавляй выдуманные факты."
+            f"Стиль: {style}. Добавь заголовок, "
+            "основной текст и призыв к действию."
         )
 
         send_message(chat_id, answer, keyboard)
         return
 
     if state.get("step") == "ideas":
+        if not can_use_ai(chat_id):
+            return
+
+        count_request(chat_id)
         user_states.pop(chat_id, None)
+
         send_message(chat_id, "💡 Подбираю идеи...")
+
         answer = ask_ai(
             chat_id,
             f"Придумай 10 интересных идей для контента "
-            f"в нише: {text}. К каждой добавь короткое описание."
+            f"в нише: {text}. К каждой добавь описание."
         )
+
         send_message(chat_id, answer, keyboard)
         return
+
+    if not can_use_ai(chat_id):
+        return
+
+    count_request(chat_id)
 
     send_message(chat_id, "⚡ Думаю над ответом...")
 
@@ -268,7 +494,10 @@ def handle_message(message):
 
 
 offset = 0
+
 load_history()
+load_users()
+
 while True:
     try:
         updates = tg_request("getUpdates", {
@@ -279,8 +508,12 @@ while True:
         for update in updates.get("result", []):
             offset = update["update_id"] + 1
 
-            if "message" in update:
+            if "callback_query" in update:
+                handle_callback(update["callback_query"])
+
+            elif "message" in update:
                 handle_message(update["message"])
 
     except Exception as error:
         print("Ошибка:", error)
+        time.sleep(3)
