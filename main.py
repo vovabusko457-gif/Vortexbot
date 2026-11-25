@@ -177,6 +177,30 @@ def send_photo(chat_id, image_data, caption=""):
     return result
 
 
+def send_document(chat_id, file_data, filename, caption=""):
+    boundary = "----VORTEX" + uuid.uuid4().hex
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        f"{chat_id}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="caption"\r\n\r\n'
+        f"{caption}\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+        "Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation\r\n\r\n"
+    ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        TG_API + "sendDocument", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": "VORTEX-Bot/1.0"}
+    )
+    with urllib.request.urlopen(req, timeout=180) as response:
+        result = json.loads(response.read())
+    if not result.get("ok"):
+        raise Exception(str(result))
+    return result
+
+
 def send_voice(chat_id, audio_data, caption=""):
     boundary = "----VORTEX" + uuid.uuid4().hex
 
@@ -1537,9 +1561,126 @@ def handle_last_image_edit(chat_id, instruction):
     return True
 
 
+def build_presentation(chat_id, user_request):
+    """Создаёт презентацию PPTX с текстом и иллюстрациями и возвращает bytes."""
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor
+        from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+        from pptx.enum.shapes import MSO_SHAPE
+    except ImportError:
+        print("python-pptx is not installed. Add python-pptx to requirements.txt")
+        return None
+
+    system = (
+        "Ты создаёшь структуру презентации на русском языке. Верни ТОЛЬКО валидный JSON без Markdown. "
+        "Формат: {\"title\":\"...\",\"subtitle\":\"...\",\"slides\":[{"
+        "\"title\":\"...\",\"bullets\":[\"...\"],\"image_prompt\":\"...\"}]} . "
+        "Сделай 6 содержательных слайдов после титульного. На каждом 2-4 коротких пункта. "
+        "image_prompt на английском, конкретно описывает тематическую фотографию без текста и надписей. "
+        "Не выдумывай статистику и факты. Если нужны цифры, избегай неподтверждённых точных значений."
+    )
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Подготовь презентацию по запросу: " + user_request}
+        ],
+        "temperature": 0.35,
+        "max_completion_tokens": 2200
+    }
+    req = urllib.request.Request(GROQ_API, data=json.dumps(payload).encode(), headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {GROQ_KEY}", "User-Agent": "VORTEX-Bot/1.0"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            result = json.loads(response.read())
+        raw = result["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        data = json.loads(raw)
+        slides = data.get("slides", [])[:6]
+        if not slides:
+            raise ValueError("Модель не вернула слайды")
+    except Exception as error:
+        print("Presentation outline error:", error)
+        return None
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+    navy = RGBColor(17, 32, 58)
+    blue = RGBColor(36, 105, 190)
+    white = RGBColor(255, 255, 255)
+    pale = RGBColor(239, 244, 250)
+
+    def add_bg(slide, color):
+        shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+        shape.fill.solid(); shape.fill.fore_color.rgb = color
+        shape.line.fill.background()
+        slide.shapes._spTree.remove(shape._element)
+        slide.shapes._spTree.insert(2, shape._element)
+
+    def add_text(slide, text, x, y, w, h, size, color, bold=False):
+        box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        tf = box.text_frame; tf.clear(); tf.word_wrap = True
+        tf.margin_left = Inches(0.05); tf.margin_right = Inches(0.05)
+        p0 = tf.paragraphs[0]; p0.text = str(text)
+        p0.font.name = "Aptos"; p0.font.size = Pt(size); p0.font.bold = bold; p0.font.color.rgb = color
+        return box
+
+    # Титульный слайд с тематической обложкой
+    cover = prs.slides.add_slide(blank); add_bg(cover, navy)
+    cover_prompt = "Professional cinematic editorial photograph for a presentation about " + str(data.get("title", user_request)) + ", wide landscape composition, no text, no letters, no watermark"
+    cover_img = generate_image(cover_prompt)
+    if cover_img:
+        try:
+            cover.shapes.add_picture(io.BytesIO(cover_img), Inches(7.0), Inches(0), width=Inches(6.333), height=Inches(7.5))
+        except Exception as error: print("Cover image error:", error)
+    add_text(cover, data.get("title", user_request), 0.75, 1.8, 6.0, 1.5,  thirty:=30, white, True)
+    add_text(cover, data.get("subtitle", "Подготовлено VORTEX"), 0.8, 3.55, 5.7, 1.0, 19, RGBColor(205, 220, 240))
+    add_text(cover, "VORTEX", 0.8, 6.65, 3.0, 0.4, 13, RGBColor(120, 170, 235), True)
+
+    for index, item in enumerate(slides, start=1):
+        slide = prs.slides.add_slide(blank); add_bg(slide, pale)
+        # Верхняя синяя полоса
+        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.16))
+        bar.fill.solid(); bar.fill.fore_color.rgb = blue; bar.line.fill.background()
+        add_text(slide, item.get("title", f"Раздел {index}"), 0.65, 0.48, 12.0, 0.8, 26, navy, True)
+        bullets = item.get("bullets", [])[:4]
+        text_box = slide.shapes.add_textbox(Inches(0.8), Inches(1.65), Inches(5.6), Inches(4.9))
+        tf = text_box.text_frame; tf.clear(); tf.word_wrap = True
+        for j, bullet in enumerate(bullets):
+            para = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+            para.text = "•  " + str(bullet)
+            para.font.name = "Aptos"; para.font.size = Pt(19); para.font.color.rgb = navy
+            para.space_after = Pt(18)
+        image_prompt = item.get("image_prompt") or ("High quality editorial photograph illustrating " + str(item.get("title", user_request)))
+        image_bytes = generate_image(str(image_prompt) + ", realistic professional photography, landscape, no text, no watermark")
+        if image_bytes:
+            try:
+                slide.shapes.add_picture(io.BytesIO(image_bytes), Inches(6.8), Inches(1.55), width=Inches(5.85), height=Inches(4.8))
+            except Exception as error: print("Slide image error:", error)
+        else:
+            add_text(slide, "Иллюстрация временно недоступна", 7.0, 3.4, 5.2, 0.6, 16, blue)
+        add_text(slide, f"{index:02d}", 12.15, 6.85, 0.5, 0.3, 11, blue, True)
+
+    output = io.BytesIO()
+    prs.save(output)
+    return output.getvalue()
+
+
 def detect_intent(text):
     """Распознаёт намерение пользователя по обычной русской формулировке."""
     value = text.lower().strip().replace("ё", "е")
+
+    presentation_patterns = (
+        r"\b(?:презентац\w*|слайд\w*)\b",
+        r"\b(?:сделай|создай|подготовь|составь)\b.*\b(?:powerpoint|pptx)\b"
+    )
+    if any(re.search(pattern, value) for pattern in presentation_patterns):
+        return "presentation"
 
     # Не требуем одну конкретную фразу: «сделай мне фотку BMW»,
     # «хочу изображение…», «нарисуй…» должны вести в генератор.
@@ -1614,7 +1755,7 @@ def handle_message(message):
             "⚡ VORTEX на связи.\n\n"
             "Просто напиши, что нужно сделать, или отправь голосовое.\n\n"
             "Я могу создать пост, придумать идеи, ответить на вопрос, "
-            "сгенерировать изображение или отредактировать присланное фото.\n\n"
+            "сгенерировать изображение, отредактировать фото или создать презентацию PowerPoint.\n\n"
             "Голосовое сообщение → голосовой ответ.\n"
             "Текст → текстовый ответ.\n\n"
             "Команды: /profile, /buy, /terms, /paysupport, /cancel\n\n"
@@ -1684,7 +1825,7 @@ def handle_message(message):
     if text == "✨ Возможности":
         send_message(chat_id,
             "Я умею создавать посты, придумывать идеи, отвечать на вопросы, "
-            "генерировать изображения и редактировать фотографии. "
+            "генерировать изображения, редактировать фотографии и создавать презентации PowerPoint. "
             "Просто напиши задачу обычными словами.")
         return
 
@@ -1700,6 +1841,20 @@ def handle_message(message):
         return
 
     intent = "chat" if is_voice else detect_intent(text)
+
+    if intent == "presentation":
+        send_message(chat_id, "Понял. Собираю презентацию: готовлю содержание, иллюстрации и оформляю слайды. Это может занять несколько минут.")
+        presentation_data = build_presentation(chat_id, text)
+        if not presentation_data:
+            send_message(chat_id, "Не получилось собрать презентацию. Проверь, что в Railway установлена библиотека python-pptx, а Cloudflare и Groq доступны.")
+            return
+        try:
+            send_document(chat_id, presentation_data, "VORTEX_presentation.pptx", "Готово. Презентация PowerPoint с иллюстрациями.")
+            count_request(chat_id)
+        except Exception as error:
+            print("Presentation send error:", error)
+            send_message(chat_id, "Презентация создана, но Telegram не смог отправить файл.")
+        return
 
     if intent == "image":
         if not CF_ACCOUNT_ID or not CF_API_TOKEN:
