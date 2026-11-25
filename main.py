@@ -28,9 +28,12 @@ MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
 
 CHANNEL = "@VORTEX_RELAX"
+
 FREE_REQUESTS = 5
 TRIAL_DAYS = 7
-PRICE = 99
+
+STARS_PRICE = 65
+PREMIUM_DAYS = 30
 
 user_states = {}
 chat_histories = {}
@@ -40,7 +43,7 @@ keyboard = {
     "keyboard": [
         [{"text": "✨ Возможности"}, {"text": "✍️ Создать пост"}],
         [{"text": "💡 Идеи для контента"}, {"text": "🎨 Создать картинку"}],
-        [{"text": "👤 Мой профиль"}]
+        [{"text": "👤 Мой профиль"}, {"text": "💎 Купить Premium"}]
     ],
     "resize_keyboard": True
 }
@@ -166,11 +169,35 @@ def get_user(chat_id):
         users[key] = {
             "requests": 0,
             "trial_until": None,
-            "paid_until": None
+            "paid_until": None,
+            "payment_charges": []
         }
-        save_users()
 
-    return users[key]
+    user = users[key]
+
+    # Добавляем поля пользователям из старой базы
+    user.setdefault("requests", 0)
+    user.setdefault("trial_until", None)
+    user.setdefault("paid_until", None)
+    user.setdefault("payment_charges", [])
+
+    return user
+
+
+def parse_date(value):
+    if not value:
+        return None
+
+    try:
+        result = datetime.fromisoformat(value)
+
+        if result.tzinfo is None:
+            result = result.replace(tzinfo=timezone.utc)
+
+        return result
+
+    except (ValueError, TypeError):
+        return None
 
 
 # =========================
@@ -224,31 +251,194 @@ def subscription_message(chat_id):
     )
 
 
+# =========================
+# TELEGRAM STARS
+# =========================
+
 def payment_message(chat_id):
-    send_message(
-        chat_id,
-        "⚡ VORTEX PREMIUM\n\n"
-        "Твой бесплатный период закончился.\n\n"
-        "Стоимость доступа: 99 ₽ / 30 дней.\n\n"
-        "Скоро здесь появится возможность оплаты.\n"
-        "Пока платная подписка ещё не подключена."
+    payload = f"vortex_premium_30:{chat_id}:{uuid.uuid4().hex}"
+
+    prices = [{
+        "label": "VORTEX PREMIUM на 30 дней",
+        "amount": STARS_PRICE
+    }]
+
+    data = {
+        "chat_id": chat_id,
+        "title": "VORTEX PREMIUM",
+        "description": (
+            "30 дней полного доступа к VORTEX: "
+            "ИИ, создание постов, идеи, голосовые "
+            "и генерация изображений."
+        ),
+        "payload": payload,
+        "currency": "XTR",
+        "prices": json.dumps(prices, ensure_ascii=False)
+    }
+
+    try:
+        result = tg_request("sendInvoice", data)
+
+        if not result.get("ok"):
+            print("Invoice error:", result)
+            send_message(
+                chat_id,
+                "❌ Не удалось выставить счёт.\n"
+                "Попробуй немного позже.",
+                keyboard
+            )
+            return
+
+        print("Invoice sent:", chat_id, payload)
+
+    except Exception as error:
+        print("Invoice sending error:", error)
+        send_message(
+            chat_id,
+            "❌ Ошибка при создании счёта. Попробуй позже.",
+            keyboard
+        )
+
+
+def handle_pre_checkout(query):
+    query_id = query["id"]
+    user_id = query["from"]["id"]
+    payload = query.get("invoice_payload", "")
+    currency = query.get("currency")
+    amount = query.get("total_amount")
+
+    parts = payload.split(":")
+
+    valid_payload = (
+        len(parts) == 3
+        and parts[0] == "vortex_premium_30"
+        and parts[1] == str(user_id)
     )
 
+    valid_payment = (
+        valid_payload
+        and currency == "XTR"
+        and amount == STARS_PRICE
+    )
+
+    if not valid_payment:
+        tg_request("answerPreCheckoutQuery", {
+            "pre_checkout_query_id": query_id,
+            "ok": "false",
+            "error_message": (
+                "Счёт недействителен. "
+                "Открой VORTEX и создай новый."
+            )
+        })
+        print("Rejected pre-checkout:", user_id, payload)
+        return
+
+    tg_request("answerPreCheckoutQuery", {
+        "pre_checkout_query_id": query_id,
+        "ok": "true"
+    })
+
+    print("Pre-checkout approved:", user_id)
+
+
+def activate_premium(message):
+    chat_id = message["chat"]["id"]
+    payment = message.get("successful_payment", {})
+
+    currency = payment.get("currency")
+    amount = payment.get("total_amount")
+    payload = payment.get("invoice_payload", "")
+    charge_id = payment.get("telegram_payment_charge_id")
+
+    parts = payload.split(":")
+
+    valid_payload = (
+        len(parts) == 3
+        and parts[0] == "vortex_premium_30"
+        and parts[1] == str(chat_id)
+    )
+
+    if (
+        not valid_payload
+        or currency != "XTR"
+        or amount != STARS_PRICE
+        or not charge_id
+    ):
+        print("Invalid successful payment:", payment)
+        send_message(
+            chat_id,
+            "❌ Не удалось подтвердить платёж автоматически. "
+            "Обратись в поддержку VORTEX."
+        )
+        return
+
+    user = get_user(chat_id)
+
+    charges = user.get("payment_charges", [])
+
+    # Защита от повторной обработки одного платежа
+    if charge_id in charges:
+        print("Duplicate payment ignored:", charge_id)
+        return
+
+    now = datetime.now(timezone.utc)
+    old_paid_until = parse_date(user.get("paid_until"))
+
+    # Новая подписка начинается после действующей,
+    # если она ещё не закончилась
+    start = now
+
+    if old_paid_until and old_paid_until > now:
+        start = old_paid_until
+
+    end = start + timedelta(days=PREMIUM_DAYS)
+
+    user["paid_until"] = end.isoformat()
+
+    charges.append(charge_id)
+    user["payment_charges"] = charges[-100:]
+
+    save_users()
+
+    print(
+        "Premium activated:",
+        chat_id,
+        "until:",
+        end.isoformat(),
+        "charge:",
+        charge_id
+    )
+
+    send_message(
+        chat_id,
+        "🎉 ОПЛАТА УСПЕШНА!\n\n"
+        "⚡ VORTEX PREMIUM активирован.\n\n"
+        "⭐ Оплачено: 65 Stars\n"
+        "📅 Срок: 30 дней\n\n"
+        f"Доступ действует до: "
+        f"{end.strftime('%d.%m.%Y %H:%M')} UTC\n\n"
+        "Теперь тебе доступны все функции VORTEX. 🚀",
+        keyboard
+    )
+
+
+# =========================
+# ПРОВЕРКА ДОСТУПА
+# =========================
 
 def check_access(chat_id):
     user = get_user(chat_id)
 
-    paid_until = user.get("paid_until")
-    trial_until = user.get("trial_until")
+    paid_until = parse_date(user.get("paid_until"))
+    trial_until = parse_date(user.get("trial_until"))
 
     now = datetime.now(timezone.utc)
 
-    if paid_until:
-        if now < datetime.fromisoformat(paid_until):
-            return "paid"
+    if paid_until and now < paid_until:
+        return "paid"
 
     if trial_until:
-        if now < datetime.fromisoformat(trial_until):
+        if now < trial_until:
             if is_subscribed(chat_id):
                 return "trial"
 
@@ -273,6 +463,12 @@ def can_use_ai(chat_id):
         return False
 
     if access == "expired":
+        send_message(
+            chat_id,
+            "⏳ Твой доступ закончился.\n\n"
+            "Оформи VORTEX PREMIUM, чтобы продолжить.",
+            keyboard
+        )
         payment_message(chat_id)
         return False
 
@@ -573,9 +769,16 @@ def handle_callback(callback):
 
 def handle_message(message):
     chat_id = message["chat"]["id"]
+
+    # СНАЧАЛА ОБРАБАТЫВАЕМ УСПЕШНУЮ ОПЛАТУ
+    if message.get("successful_payment"):
+        activate_premium(message)
+        return
+
     text = message.get("text", "").strip()
     is_voice = bool(message.get("voice"))
 
+    # ГОЛОСОВЫЕ
     if is_voice:
         if not can_use_ai(chat_id):
             return
@@ -627,10 +830,43 @@ def handle_message(message):
         )
         return
 
+    # УСЛОВИЯ
+    if text == "/terms":
+        send_message(
+            chat_id,
+            "📄 Условия VORTEX PREMIUM\n\n"
+            "1. Premium предоставляет доступ к функциям "
+            "VORTEX на 30 дней.\n"
+            "2. Стоимость одного периода: 65 Telegram Stars.\n"
+            "3. Доступ активируется после подтверждения "
+            "успешного платежа Telegram.\n"
+            "4. Подписка не продлевается автоматически.\n"
+            "5. Для продления необходимо совершить новый платёж.\n"
+            "6. По вопросам оплаты используй команду /paysupport."
+        )
+        return
+
+    # ПОДДЕРЖКА ОПЛАТЫ
+    if text == "/paysupport":
+        send_message(
+            chat_id,
+            "🛟 Поддержка VORTEX\n\n"
+            "Если возникла проблема с оплатой, напиши "
+            "владельцу бота через контакт, указанный "
+            "в канале @VORTEX_RELAX.\n\n"
+            "Сохрани чек Telegram, он поможет проверить платёж."
+        )
+        return
+
     # ОТМЕНА
     if text in ["/cancel", "❌ Отмена"]:
         user_states.pop(chat_id, None)
         send_message(chat_id, "Действие отменено.", keyboard)
+        return
+
+    # ПОКУПКА PREMIUM
+    if text in ["/buy", "💎 Купить Premium"]:
+        payment_message(chat_id)
         return
 
     # ВОЗМОЖНОСТИ
@@ -644,7 +880,8 @@ def handle_message(message):
             "• Ответы на вопросы\n"
             "• Разные стили написания\n"
             "• 🎙️ Распознавание голосовых\n"
-            "• 🎨 Генерация изображений",
+            "• 🎨 Генерация изображений\n\n"
+            "💎 Premium: 65 Stars за 30 дней.",
             keyboard
         )
         return
@@ -714,18 +951,33 @@ def handle_message(message):
                 f"Бесплатные запросы: "
                 f"{user['requests']}/{FREE_REQUESTS}"
             )
+
         elif access == "trial":
-            status = "Статус: 7 дней бесплатного доступа"
+            trial_end = parse_date(user.get("trial_until"))
+            status = (
+                "Статус: бесплатный доступ\n"
+                f"До: {trial_end.strftime('%d.%m.%Y')} UTC"
+            )
+
         elif access == "paid":
-            status = "Статус: PREMIUM"
+            paid_end = parse_date(user.get("paid_until"))
+            status = (
+                "Статус: 💎 PREMIUM\n"
+                f"До: {paid_end.strftime('%d.%m.%Y %H:%M')} UTC"
+            )
+
         elif access == "expired":
             status = "Статус: доступ закончился"
+
         else:
             status = "Статус: требуется подписка на канал"
 
         send_message(
             chat_id,
-            f"👤 Твой профиль\nID: {chat_id}\n\n{status}",
+            f"👤 Твой профиль\n"
+            f"ID: {chat_id}\n\n"
+            f"{status}\n\n"
+            f"💎 Premium: {STARS_PRICE} Stars / 30 дней",
             keyboard
         )
         return
@@ -909,14 +1161,24 @@ def main():
         try:
             updates = tg_request("getUpdates", {
                 "offset": offset,
-                "timeout": 30
+                "timeout": 30,
+                "allowed_updates": json.dumps([
+                    "message",
+                    "callback_query",
+                    "pre_checkout_query"
+                ])
             })
 
             for update in updates.get("result", []):
                 offset = update["update_id"] + 1
 
                 try:
-                    if "callback_query" in update:
+                    if "pre_checkout_query" in update:
+                        handle_pre_checkout(
+                            update["pre_checkout_query"]
+                        )
+
+                    elif "callback_query" in update:
                         handle_callback(update["callback_query"])
 
                     elif "message" in update:
