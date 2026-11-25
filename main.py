@@ -1430,25 +1430,55 @@ def transcribe_audio_bytes(audio_data, filename="circle.mp3", content_type="audi
     return result.get("text", "").strip()
 
 
+def transcribe_long_audio(audio_path, temp_dir, chunk_seconds=300):
+    """Распознаёт длинную аудиодорожку частями, чтобы не упираться в лимиты Whisper."""
+    chunk_pattern = os.path.join(temp_dir, "audio_part_%03d.mp3")
+    split_result = subprocess.run(
+        ["ffmpeg", "-y", "-i", audio_path, "-f", "segment",
+         "-segment_time", str(chunk_seconds), "-reset_timestamps", "1",
+         "-ac", "1", "-ar", "16000", "-b:a", "48k", chunk_pattern],
+        capture_output=True, text=True, timeout=180
+    )
+    if split_result.returncode != 0:
+        raise RuntimeError("Не удалось разделить длинное аудио: " + (split_result.stderr or "")[-1000:])
+
+    parts = sorted(
+        os.path.join(temp_dir, name) for name in os.listdir(temp_dir)
+        if name.startswith("audio_part_") and name.endswith(".mp3")
+    )
+    recognized = []
+    for index, part_path in enumerate(parts, start=1):
+        with open(part_path, "rb") as audio_file:
+            part_data = audio_file.read()
+        if not part_data:
+            continue
+        print(f"[VIDEO NOTE] Whisper chunk {index}/{len(parts)}, bytes={len(part_data)}")
+        text_part = transcribe_audio_bytes(
+            part_data, filename=f"circle_part_{index}.mp3", content_type="audio/mpeg"
+        )
+        if text_part:
+            recognized.append(text_part)
+    return " ".join(recognized).strip()
+
+
 def analyze_video_note(file_id, user_request=""):
-    """Независимо извлекает кадры и звук из короткого Telegram-видеокружка."""
+    """Анализирует видеокружок/видеосообщение, включая длинную речь."""
     if not file_id:
         raise ValueError("У видеокружка отсутствует file_id")
 
     video_data = download_telegram_file(file_id)
     if not video_data:
-        raise ValueError("Telegram вернул пустой виде файл")
+        raise ValueError("Telegram вернул пустой видеофайл")
+    # Облачный Telegram Bot API обычно позволяет скачивать ботам файлы до 20 МБ.
     if len(video_data) > 20 * 1024 * 1024:
-        raise ValueError("Видеокружок превышает лимит 20 МБ")
+        raise ValueError("Файл больше 20 МБ. Через стандартный Telegram Bot API бот не может скачать его целиком.")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         video_path = os.path.join(temp_dir, "circle.mp4")
-        audio_path = os.path.join(temp_dir, "circle.mp3")
+        audio_path = os.path.join(temp_dir, "circle_audio.mp3")
         with open(video_path, "wb") as f:
             f.write(video_data)
 
-        # Сначала узнаём длительность и наличие потоков. Ошибка ffprobe
-        # не должна мешать попытке извлечь кадры.
         duration = 0.0
         has_audio = False
         has_video = True
@@ -1456,7 +1486,7 @@ def analyze_video_note(file_id, user_request=""):
             probe = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries",
                  "format=duration:stream=codec_type", "-of", "json", video_path],
-                capture_output=True, text=True, timeout=25
+                capture_output=True, text=True, timeout=30
             )
             if probe.returncode == 0 and probe.stdout.strip():
                 probe_data = json.loads(probe.stdout)
@@ -1471,32 +1501,22 @@ def analyze_video_note(file_id, user_request=""):
         except Exception as error:
             print("[VIDEO NOTE] ffprobe error:", repr(error))
 
-        print(
-            f"[VIDEO NOTE] duration={duration:.2f}s, bytes={len(video_data)}, "
-            f"video={has_video}, audio={has_audio}"
-        )
+        print(f"[VIDEO NOTE] duration={duration:.2f}s, bytes={len(video_data)}, video={has_video}, audio={has_audio}")
 
-        # Аудио обрабатывается отдельно: отсутствие дорожки или ошибка
-        # Whisper не обрывает визуальный анализ кружка.
         spoken_text = ""
         if has_audio:
             try:
                 audio_result = subprocess.run(
                     ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1",
                      "-ar", "16000", "-b:a", "48k", audio_path],
-                    capture_output=True, text=True, timeout=90
+                    capture_output=True, text=True, timeout=180
                 )
                 if audio_result.returncode == 0 and os.path.exists(audio_path):
-                    with open(audio_path, "rb") as f:
-                        audio_data = f.read()
-                    if audio_data:
-                        try:
-                            spoken_text = transcribe_audio_bytes(
-                                audio_data, filename="circle.mp3", content_type="audio/mpeg"
-                            ) or ""
-                            print("[VIDEO NOTE] speech recognized:", bool(spoken_text))
-                        except Exception as error:
-                            print("[VIDEO NOTE] Whisper error:", repr(error))
+                    try:
+                        spoken_text = transcribe_long_audio(audio_path, temp_dir)
+                        print(f"[VIDEO NOTE] speech recognized: {bool(spoken_text)}, chars={len(spoken_text)}")
+                    except Exception as error:
+                        print("[VIDEO NOTE] Whisper error:", repr(error))
                 else:
                     print("[VIDEO NOTE] audio extraction failed:", (audio_result.stderr or "")[-1200:])
             except Exception as error:
@@ -1504,18 +1524,16 @@ def analyze_video_note(file_id, user_request=""):
         else:
             print("[VIDEO NOTE] no audio stream; continuing with video frames")
 
-        # Кадры извлекаются независимо от аудио. Для коротких кружков
-        # используем относительные позиции внутри фактической длительности.
+        # Для длинного ролика берём равномерно распределённые кадры по всей длительности.
         frame_paths = []
         if has_video:
             if duration > 0.1:
-                if duration <= 1.2:
-                    seeks = [duration * 0.5]
+                frame_count = min(12, max(3, int(duration // 5) + 1))
+                if frame_count == 1:
+                    seeks = [duration / 2]
                 else:
-                    seeks = [duration * 0.12, duration * 0.50, duration * 0.88]
+                    seeks = [duration * i / (frame_count - 1) for i in range(frame_count)]
             else:
-                # Если ffprobe не смог определить длительность, пробуем
-                # несколько безопасных позиций, начиная с самого начала.
                 seeks = [0.0, 0.5, 1.0]
 
             for index, seek in enumerate(seeks):
@@ -1527,63 +1545,53 @@ def analyze_video_note(file_id, user_request=""):
                      "-q:v", "5", frame_path],
                     capture_output=True, text=True, timeout=45
                 )
-                if (frame_result.returncode == 0 and os.path.exists(frame_path)
-                        and os.path.getsize(frame_path) > 0):
+                if frame_result.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
                     frame_paths.append(frame_path)
                 else:
-                    print(
-                        f"[VIDEO NOTE] frame {index} failed:",
-                        (frame_result.stderr or "")[-500:]
-                    )
+                    print(f"[VIDEO NOTE] frame {index} failed:", (frame_result.stderr or "")[-500:])
 
-        if not frame_paths:
-            raise RuntimeError(
-                "Не удалось извлечь кадры из кружка. "
-                "Проверьте формат видео и наличие видеодорожки."
-            )
+        if not frame_paths and not spoken_text:
+            raise RuntimeError("Не удалось получить ни кадры, ни распознанную речь из видео.")
 
         content = [{"type": "text", "text": (
-            "Проанализируй короткое видеосообщение Telegram (видеокружок). "
-            "Оно может длиться всего 1-5 секунд: это нормально, не называй его слишком длинным "
-            "и не отказывайся из-за длительности. Используй все переданные кадры и распознанную речь. "
-            "Опиши только то, что действительно видно. Ответь на запрос пользователя. "
-            "Если пользователь просит перевод, переведи распознанную речь полностью, "
-            "сохраняя смысл и тон, без пересказа. Не выдумывай отсутствующие слова.\n"
+            "Проанализируй видеосообщение Telegram целиком. Кадры расположены по времени от начала к концу. "
+            "Используй все кадры и распознанную речь. Подробно, но понятно расскажи, что происходит, "
+            "кто или что присутствует, какие действия сменяют друг друга и чем заканчивается ролик. "
+            "Не выдумывай то, чего не видно и не слышно. Сформулируй ответ для озвучивания голосом: "
+            "естественно, без списков, Markdown и длинных вступлений. Если пользователь попросил перевод, "
+            "переведи речь полностью, сохраняя смысл.\n"
+            f"Длительность видео: {duration:.1f} секунд.\n"
             f"Распознанная речь: {spoken_text or 'Речь не распознана или аудио отсутствует.'}\n"
-            f"Запрос пользователя: {user_request or 'Опиши, что происходит в кружке.'}"
+            f"Запрос пользователя: {user_request or 'Расскажи, что происходит в видео.'}"
         )}]
 
         for frame_path in frame_paths:
             with open(frame_path, "rb") as f:
                 encoded = base64.b64encode(f.read()).decode("ascii")
-            content.append({"type": "image_url", "image_url": {
-                "url": "data:image/jpeg;base64," + encoded
-            }})
+            content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}})
 
         payload = {
             "model": VISION_MODEL,
             "messages": [
                 {"role": "system", "content": (
                     "Ты VORTEX, спокойный и компетентный персональный ИИ-помощник. "
-                    "Обращайся к пользователю 'сэр' естественно, не в каждом предложении. "
                     "Отвечай по-русски, если не просят другой язык. "
-                    "Не используй Markdown, хештеги и декоративные символы. "
-                    "Не придумывай детали, которых нет в видео или аудио. "
-                    "Короткая длительность кружка не является причиной отказа: анализируй доступные кадры."
+                    "Пиши так, чтобы ответ хорошо звучал в голосовом сообщении. "
+                    "Не используй Markdown, списки и декоративные символы. "
+                    "Не придумывай детали, которых нет в видео или аудио."
                 )},
                 {"role": "user", "content": content}
             ],
             "temperature": 0.2,
-            "max_completion_tokens": 900
+            "max_completion_tokens": 1100
         }
         req = urllib.request.Request(
             GROQ_API, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {GROQ_KEY}",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_KEY}",
                      "User-Agent": "VORTEX-Bot/1.0"}
         )
         try:
-            with urllib.request.urlopen(req, timeout=150) as response:
+            with urllib.request.urlopen(req, timeout=180) as response:
                 result = json.loads(response.read())
         except urllib.error.HTTPError as error:
             details = error.read().decode(errors="ignore")
@@ -1607,37 +1615,30 @@ def handle_video_note(message):
     if not can_use_ai(chat_id):
         return
 
-    send_message(chat_id, "Сэр, анализирую видеокружок. Проверяю изображение и речь...")
+    send_message(chat_id, "Сэр, смотрю видео целиком и разбираю речь. Это может занять немного времени...")
     try:
-        note = message.get("video_note") or {}
+        note = message.get("video_note") or message.get("video") or {}
         file_id = note.get("file_id")
         if not file_id:
-            raise ValueError("В сообщении отсутствует video_note.file_id")
+            raise ValueError("В сообщении отсутствует file_id")
 
-        answer, spoken_text = analyze_video_note(
-            file_id, message.get("caption", "")
-        )
+        answer, spoken_text = analyze_video_note(file_id, message.get("caption", ""))
         if spoken_text:
             last_video_transcripts[chat_id] = spoken_text
 
         count_request(chat_id)
         send_message(chat_id, answer)
 
-        # Сохраняем прежнее поведение озвучки перевода, если запрос передан в caption.
-        if re.search(
-            r"(?i)перевед|translate|translation|на английск|на немецк|на французск|на испанск",
-            message.get("caption", "")
-        ):
-            audio_data = text_to_speech(answer)
-            if audio_data:
-                send_voice(chat_id, audio_data, "Перевод, сэр")
+        # VORTEX также присылает краткий разбор голосом.
+        audio_data = text_to_speech(answer)
+        if audio_data:
+            send_voice(chat_id, audio_data, "Что происходит в видео")
+        else:
+            send_message(chat_id, "Сэр, текстовый разбор готов, но озвучку сейчас создать не удалось.")
 
     except Exception as error:
         print("[VIDEO NOTE] Handler error:", repr(error))
-        send_message(
-            chat_id,
-            "Сэр, не удалось обработать кружок. Попробуйте отправить его ещё раз."
-        )
+        send_message(chat_id, "Сэр, не удалось обработать видео. Попробуйте отправить его ещё раз или файл меньшего размера.")
 
 
 # =========================
@@ -1966,8 +1967,8 @@ def handle_message(message):
         activate_premium(message)
         return
 
-    # Видеокружки обрабатываются отдельно: кадры + распознавание речи + перевод.
-    if message.get("video_note"):
+    # Видеокружки и обычные видео обрабатываются отдельно: кадры + длинная речь + голосовой разбор.
+    if message.get("video_note") or message.get("video"):
         handle_video_note(message)
         return
 
