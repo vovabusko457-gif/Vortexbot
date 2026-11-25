@@ -1511,10 +1511,11 @@ def transcribe_audio_bytes(audio_data, filename="circle.mp3", content_type="audi
 
 
 def analyze_video_note(file_id, user_request=""):
-    """Извлекает звук и несколько кадров кружка, затем анализирует их через модели Groq."""
+    """Полностью извлекает аудио и анализирует видеокружок по кадрам по всей длительности."""
     video_data = download_telegram_file(file_id)
+    # Облачный Telegram Bot API обычно ограничивает скачивание файлов ботом 20 МБ.
     if not video_data or len(video_data) > 20 * 1024 * 1024:
-        raise Exception("Кружок пустой или превышает лимит 20 МБ")
+        raise Exception("Кружок пустой или превышает доступный Telegram Bot API лимит скачивания 20 МБ")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         video_path = os.path.join(temp_dir, "circle.mp4")
@@ -1525,7 +1526,7 @@ def analyze_video_note(file_id, user_request=""):
         subprocess.run([
             "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1",
             "-ar", "16000", "-b:a", "48k", audio_path
-        ], check=True, capture_output=True, timeout=90)
+        ], check=True, capture_output=True, timeout=180)
         with open(audio_path, "rb") as f:
             audio_data = f.read()
         spoken_text = transcribe_audio_bytes(audio_data) if audio_data else ""
@@ -1541,13 +1542,16 @@ def analyze_video_note(file_id, user_request=""):
             duration = 3.0
         print(f"[VIDEO NOTE] duration={duration:.2f}s, bytes={len(video_data)}")
 
-        # Берём кадры внутри длительности, а не ищем кадр на 4-й секунде
-        # у трёхсекундного кружка.
+        # Groq vision принимает максимум 3 изображения за запрос.
+        # Поэтому равномерно берём начало, середину и конец ВСЕГО кружка.
+        # Аудиодорожка при этом извлекается и распознаётся целиком.
         frame_paths = []
         if duration <= 1.2:
             seeks = [duration * 0.5]
+        elif duration <= 4.0:
+            seeks = [duration * 0.15, duration * 0.50, duration * 0.85]
         else:
-            seeks = [duration * 0.12, duration * 0.50, duration * 0.88]
+            seeks = [min(0.2, duration * 0.05), duration * 0.50, max(0.0, duration - 0.2)]
         for index, seek in enumerate(seeks):
             frame_path = os.path.join(temp_dir, f"frame_{index}.jpg")
             result = subprocess.run([
@@ -1559,9 +1563,8 @@ def analyze_video_note(file_id, user_request=""):
                 frame_paths.append(frame_path)
 
         content = [{"type": "text", "text": (
-            "Проанализируй короткое видеосообщение Telegram (видеокружок). "
-            "Оно может длиться всего 1-5 секунд: это нормально, не называй его слишком длинным "
-            "и не отказывайся из-за длительности. Используй все переданные кадры и распознанную речь. "
+            "Проанализируй видеосообщение Telegram (видеокружок) целиком. "
+            "Используй все переданные кадры, выбранные по всей длительности видео, и полную распознанную аудиодорожку. "
             "Опиши только то, что действительно видно. Ответь на запрос пользователя. "
             "Если пользователь просит перевод, переведи распознанную речь полностью, "
             "сохраняя смысл и тон, без пересказа. Не выдумывай отсутствующие слова.\n"
@@ -1584,7 +1587,7 @@ def analyze_video_note(file_id, user_request=""):
                     "Отвечай по-русски, если не просят другой язык. "
                     "Не используй Markdown, хештеги и декоративные символы. "
                     "Не придумывай детали, которых нет в видео или аудио. "
-                    "Короткая длительность кружка не является причиной отказа: анализируй доступные кадры."
+                    "Анализируй доступные кадры и всю распознанную речь; не утверждай, что видел детали, которых нет на кадрах."
                 )},
                 {"role": "user", "content": content}
             ],
@@ -1603,26 +1606,28 @@ def analyze_video_note(file_id, user_request=""):
 
 
 def handle_video_note(message):
+    """Принимает видеокружок, анализирует его и отвечает ТОЛЬКО обычным голосовым."""
     chat_id = message["chat"]["id"]
     if not can_use_ai(chat_id):
         return
-    send_message(chat_id, "Сэр, анализирую видеокружок. Проверяю изображение и речь...")
     try:
         note = message.get("video_note") or {}
         answer, spoken_text = analyze_video_note(note.get("file_id"), message.get("caption", ""))
         if spoken_text:
             last_video_transcripts[chat_id] = spoken_text
         count_request(chat_id)
-        send_message(chat_id, answer)
 
-        # Для запроса перевода дополнительно озвучиваем результат.
-        if re.search(r"(?i)перевед|translate|translation|на английск|на немецк|на французск|на испанск", message.get("caption", "")):
-            audio_data = text_to_speech(answer)
-            if audio_data:
-                send_voice(chat_id, audio_data, "Перевод, сэр")
+        audio_data = text_to_speech(answer)
+        if not audio_data:
+            raise Exception("TTS не вернул аудиофайл")
+        send_voice(chat_id, audio_data)
     except Exception as error:
         print("Video note handler error:", repr(error))
-        send_message(chat_id, "Сэр, не удалось обработать этот кружок. Попробуйте отправить его ещё раз или чуть короче.")
+        send_message(
+            chat_id,
+            "Сэр, не удалось обработать кружок или создать голосовой ответ. "
+            "Попробуйте ещё раз. Учтите, что у Telegram Bot API есть ограничения на размер скачиваемого файла."
+        )
 
 
 # =========================
