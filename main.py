@@ -1,14 +1,16 @@
 
 import os
+import sys
 import json
 import time
 import uuid
 import base64
 import io
-import asyncio
+import subprocess
+import tempfile
+import wave
 import urllib.request
 import urllib.error
-from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageOps
 
@@ -35,7 +37,10 @@ CF_EDIT_API = (
 
 MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
-TTS_VOICE = "ru-RU-DmitryNeural"
+
+PIPER_VOICE = "ru_RU-dmitri-medium"
+PIPER_DIR = os.path.join(os.getcwd(), "piper_voices")
+piper_model = None
 
 CHANNEL = "@VORTEX_RELAX"
 
@@ -73,7 +78,7 @@ style_keyboard = {
 # =========================
 
 def tg_request(method, data=None):
-    body = urlencode(data or {}).encode()
+    body = urllib.parse.urlencode(data or {}).encode()
 
     req = urllib.request.Request(
         TG_API + method,
@@ -146,8 +151,8 @@ def send_voice(chat_id, audio_data, caption=""):
         'Content-Disposition: form-data; name="caption"\r\n\r\n'
         f"{caption}\r\n"
         f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="voice"; filename="vortex.mp3"\r\n'
-        "Content-Type: audio/mpeg\r\n\r\n"
+        'Content-Disposition: form-data; name="voice"; filename="vortex.ogg"\r\n'
+        "Content-Type: audio/ogg\r\n\r\n"
     ).encode() + audio_data + (
         f"\r\n--{boundary}--\r\n"
     ).encode()
@@ -184,46 +189,97 @@ def download_telegram_file(file_id):
 
 
 # =========================
-# ГОЛОСОВЫЕ ОТВЕТЫ
+# PIPER: РУССКИЙ ГОЛОС
 # =========================
+
+def load_piper_model():
+    global piper_model
+
+    if piper_model is not None:
+        return piper_model
+
+    from piper import PiperVoice
+
+    os.makedirs(PIPER_DIR, exist_ok=True)
+
+    model_path = os.path.join(
+        PIPER_DIR,
+        PIPER_VOICE + ".onnx"
+    )
+
+    config_path = model_path + ".json"
+
+    if not os.path.exists(model_path) or not os.path.exists(config_path):
+        print("Downloading Piper voice:", PIPER_VOICE)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "piper.download_voices",
+                PIPER_VOICE,
+                "--download-dir",
+                PIPER_DIR
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            print("Piper download error:", result.stdout, result.stderr)
+            raise Exception("Не удалось скачать голос Piper")
+
+    if not os.path.exists(model_path):
+        raise Exception("Файл модели Piper не найден")
+
+    piper_model = PiperVoice.load(model_path)
+    print("Piper voice loaded:", PIPER_VOICE)
+
+    return piper_model
+
 
 def text_to_speech(text):
     try:
-        import edge_tts
-        import tempfile
-
-        async def generate():
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=TTS_VOICE
-            )
-
-            with tempfile.NamedTemporaryFile(
-                suffix=".mp3",
-                delete=False
-            ) as file:
-                path = file.name
-
-            try:
-                await communicate.save(path)
-
-                with open(path, "rb") as audio:
-                    return audio.read()
-            finally:
-                if os.path.exists(path):
-                    os.remove(path)
-
-        audio_data = asyncio.run(generate())
-
-        if not audio_data:
-            print("TTS returned empty audio")
+        if not text or not text.strip():
             return None
 
-        print("TTS audio generated:", len(audio_data), "bytes")
-        return audio_data
+        voice = load_piper_model()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wav_path = os.path.join(temp_dir, "voice.wav")
+            ogg_path = os.path.join(temp_dir, "voice.ogg")
+
+            with wave.open(wav_path, "wb") as wav_file:
+                voice.synthesize_wav(text.strip(), wav_file)
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i", wav_path,
+                    "-c:a", "libopus",
+                    "-b:a", "48k",
+                    "-ac", "1",
+                    "-ar", "48000",
+                    ogg_path
+                ],
+                check=True,
+                capture_output=True,
+                timeout=120
+            )
+
+            with open(ogg_path, "rb") as audio:
+                audio_data = audio.read()
+
+            if audio_data:
+                print("Piper audio generated:", len(audio_data), "bytes")
+                return audio_data
+
+        return None
 
     except Exception as error:
-        print("TTS error:", repr(error))
+        print("Piper TTS error:", repr(error))
         return None
 
 
@@ -1229,7 +1285,6 @@ def handle_message(message):
         activate_premium(message)
         return
 
-    # ФОТО С ПОДПИСЬЮ
     if message.get("photo"):
         handle_photo_edit(message)
         return
@@ -1237,7 +1292,6 @@ def handle_message(message):
     text = message.get("text", "").strip()
     is_voice = bool(message.get("voice"))
 
-    # ГОЛОСОВЫЕ
     if is_voice:
         if not can_use_ai(chat_id):
             return
@@ -1267,7 +1321,6 @@ def handle_message(message):
     if not text:
         return
 
-    # ПРИВЕТСТВИЕ
     if text == "/start":
         user_states.pop(chat_id, None)
         get_user(chat_id)
@@ -1290,7 +1343,6 @@ def handle_message(message):
         )
         return
 
-    # УСЛОВИЯ
     if text == "/terms":
         send_message(
             chat_id,
@@ -1306,7 +1358,6 @@ def handle_message(message):
         )
         return
 
-    # ПОДДЕРЖКА ОПЛАТЫ
     if text == "/paysupport":
         send_message(
             chat_id,
@@ -1318,18 +1369,15 @@ def handle_message(message):
         )
         return
 
-    # ОТМЕНА
     if text in ["/cancel", "❌ Отмена"]:
         user_states.pop(chat_id, None)
         send_message(chat_id, "Действие отменено.", keyboard)
         return
 
-    # ПОКУПКА PREMIUM
     if text in ["/buy", "💎 Купить Premium"]:
         payment_message(chat_id)
         return
 
-    # ВОЗМОЖНОСТИ
     if text == "✨ Возможности":
         send_message(
             chat_id,
@@ -1347,7 +1395,6 @@ def handle_message(message):
         )
         return
 
-    # СОЗДАНИЕ ПОСТА
     if text == "✍️ Создать пост":
         user_states[chat_id] = {"step": "topic"}
 
@@ -1362,7 +1409,6 @@ def handle_message(message):
         )
         return
 
-    # ГЕНЕРАЦИЯ КАРТИНОК
     if text == "🎨 Создать картинку":
         user_states[chat_id] = {"step": "image_prompt"}
 
@@ -1381,7 +1427,6 @@ def handle_message(message):
         )
         return
 
-    # ИДЕИ ДЛЯ КОНТЕНТА
     if text == "💡 Идеи для контента":
         user_states[chat_id] = {"step": "ideas"}
 
@@ -1396,7 +1441,6 @@ def handle_message(message):
         )
         return
 
-    # ПРОФИЛЬ
     if text == "👤 Мой профиль":
         user = get_user(chat_id)
         access = check_access(chat_id)
@@ -1439,7 +1483,6 @@ def handle_message(message):
 
     state = user_states.get(chat_id, {})
 
-    # ОПИСАНИЕ КАРТИНКИ
     if state.get("step") == "image_prompt":
         if not can_use_ai(chat_id):
             return
@@ -1502,7 +1545,6 @@ def handle_message(message):
 
         return
 
-    # ТЕМА ПОСТА
     if state.get("step") == "topic":
         user_states[chat_id] = {
             "step": "style",
@@ -1516,7 +1558,6 @@ def handle_message(message):
         )
         return
 
-    # СТИЛЬ ПОСТА
     if state.get("step") == "style":
         styles = {
             "💼 Деловой": "деловой и экспертный",
@@ -1553,7 +1594,6 @@ def handle_message(message):
         send_message(chat_id, answer, keyboard)
         return
 
-    # ГЕНЕРАЦИЯ ИДЕЙ
     if state.get("step") == "ideas":
         if not can_use_ai(chat_id):
             return
@@ -1572,7 +1612,6 @@ def handle_message(message):
         send_message(chat_id, answer, keyboard)
         return
 
-    # ОБЫЧНЫЙ ЧАТ И ГОЛОСОВОЙ ОТВЕТ
     if not can_use_ai(chat_id):
         return
 
