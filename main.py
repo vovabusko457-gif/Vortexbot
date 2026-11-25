@@ -52,7 +52,8 @@ TRIAL_DAYS = 7
 STARS_PRICE = 65
 PREMIUM_DAYS = 30
 
-VOICE_MAX_TOKENS = 350
+# Короткие ответы для ускорения Piper
+VOICE_MAX_TOKENS = 180
 TEXT_MAX_TOKENS = 1200
 VOICE_SPEED = "atempo=1.10"
 
@@ -268,56 +269,28 @@ def clean_text_for_voice(text):
     if not text:
         return ""
 
-    # Убираем ссылки
-    text = re.sub(
-        r"https?://\S+|www\.\S+",
-        " ",
-        text
-    )
-
-    # Убираем Markdown-блоки кода
-    text = re.sub(
-        r"```.*?```",
-        " ",
-        text,
-        flags=re.DOTALL
-    )
-
-    # Оставляем содержимое обычного кода
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
     text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"[*_#~]", " ", text)
 
     cleaned = []
 
     for char in text:
         category = unicodedata.category(char)
 
-        # Буквы, цифры и комбинируемые знаки
         if category.startswith(("L", "N", "M")):
             cleaned.append(char)
-
-        # Сохраняем пунктуацию для естественных пауз
-        elif char in ".,!?;:…":
+        elif char in ".,!?;:…-":
             cleaned.append(char)
-
-        # Переносы строк и пробелы
         elif char.isspace():
             cleaned.append(" ")
-
-        # Эмодзи и прочие символы удаляем
         else:
             cleaned.append(" ")
 
     result = "".join(cleaned)
-
-    # Убираем повторяющиеся пробелы
     result = re.sub(r"\s+", " ", result)
-
-    # Убираем пробелы перед знаками препинания
-    result = re.sub(
-        r"\s+([.,!?;:…])",
-        r"\1",
-        result
-    )
+    result = re.sub(r"\s+([.,!?;:…])", r"\1", result)
 
     return result.strip()
 
@@ -1739,9 +1712,16 @@ def handle_message(message):
         send_message(chat_id, "⚡ Думаю над ответом...")
 
     if is_voice:
+        voice_prompt = (
+            "Ответь кратко и естественно, максимум 2–4 предложения. "
+            "Не используй списки, Markdown и эмодзи. "
+            "Отвечай так, чтобы это звучало естественно голосом. "
+            "Вопрос пользователя: " + text
+        )
+
         answer = ask_ai(
             chat_id,
-            text,
+            voice_prompt,
             max_tokens=VOICE_MAX_TOKENS
         )
     else:
