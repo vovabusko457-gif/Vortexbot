@@ -1,4 +1,3 @@
-
 import os
 import sys
 import json
@@ -6,6 +5,8 @@ import time
 import uuid
 import base64
 import io
+import re
+import unicodedata
 import subprocess
 import tempfile
 import wave
@@ -259,12 +260,79 @@ def load_piper_model():
     return piper_model
 
 
+# =========================
+# ОЧИСТКА ТЕКСТА ДЛЯ ОЗВУЧКИ
+# =========================
+
+def clean_text_for_voice(text):
+    if not text:
+        return ""
+
+    # Убираем ссылки
+    text = re.sub(
+        r"https?://\S+|www\.\S+",
+        " ",
+        text
+    )
+
+    # Убираем Markdown-блоки кода
+    text = re.sub(
+        r"```.*?```",
+        " ",
+        text,
+        flags=re.DOTALL
+    )
+
+    # Оставляем содержимое обычного кода
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+
+    cleaned = []
+
+    for char in text:
+        category = unicodedata.category(char)
+
+        # Буквы, цифры и комбинируемые знаки
+        if category.startswith(("L", "N", "M")):
+            cleaned.append(char)
+
+        # Сохраняем пунктуацию для естественных пауз
+        elif char in ".,!?;:…":
+            cleaned.append(char)
+
+        # Переносы строк и пробелы
+        elif char.isspace():
+            cleaned.append(" ")
+
+        # Эмодзи и прочие символы удаляем
+        else:
+            cleaned.append(" ")
+
+    result = "".join(cleaned)
+
+    # Убираем повторяющиеся пробелы
+    result = re.sub(r"\s+", " ", result)
+
+    # Убираем пробелы перед знаками препинания
+    result = re.sub(
+        r"\s+([.,!?;:…])",
+        r"\1",
+        result
+    )
+
+    return result.strip()
+
+
 def text_to_speech(text):
     started = time.perf_counter()
 
     try:
-        if not text or not text.strip():
+        voice_text = clean_text_for_voice(text)
+
+        if not voice_text:
+            print("Piper: после очистки текст пустой")
             return None
+
+        print("[VOICE] Cleaned text:", voice_text)
 
         voice = load_piper_model()
 
@@ -275,7 +343,7 @@ def text_to_speech(text):
             synthesis_started = time.perf_counter()
 
             with wave.open(wav_path, "wb") as wav_file:
-                voice.synthesize_wav(text.strip(), wav_file)
+                voice.synthesize_wav(voice_text, wav_file)
 
             print(
                 f"[SPEED] Piper synthesis: "
