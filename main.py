@@ -243,7 +243,7 @@ def count_request(chat_id):
 
 
 # =========================
-# GROQ ИИ
+# ИИ GROQ
 # =========================
 
 def ask_ai(chat_id, prompt):
@@ -253,12 +253,17 @@ def ask_ai(chat_id, prompt):
         {
             "role": "system",
             "content": (
-                "Ты VORTEX, полезный ИИ-помощник. "
+                "Ты VORTEX, современный ИИ-помощник. "
                 "Отвечай на русском языке. "
-                "Помогай создавать качественные посты, "
-                "идеи для бизнеса и контента. "
+                "Общайся дружелюбно, уверенно и естественно. "
+                "Не будь сухим и роботизированным. "
                 "Пиши понятно, без лишней воды. "
-                "Не выдумывай факты."
+                "Помогай создавать качественные посты, "
+                "идеи для бизнеса и контента, работать с текстами "
+                "и отвечать на вопросы. "
+                "Используй эмодзи умеренно. "
+                "Не выдумывай факты. "
+                "Если не знаешь ответа, честно скажи об этом."
             )
         }
     ]
@@ -352,8 +357,6 @@ def transcribe_voice(file_id):
             print("Audio file is too large")
             return None
 
-        # Telegram voice обычно использует OGG/Opus.
-        # Проверяем сигнатуру контейнера OGG.
         print(
             "Voice file:",
             file_path,
@@ -368,9 +371,6 @@ def transcribe_voice(file_id):
             return None
 
         boundary = "----VORTEX" + uuid.uuid4().hex
-
-        # Принудительно указываем поддерживаемый формат.
-        filename = "voice.ogg"
 
         body = (
             f"--{boundary}\r\n"
@@ -471,7 +471,6 @@ def handle_message(message):
     text = message.get("text", "").strip()
     is_voice = bool(message.get("voice"))
 
-    # Голосовые сообщения
     if is_voice:
         if not can_use_ai(chat_id):
             return
@@ -501,28 +500,34 @@ def handle_message(message):
     if not text:
         return
 
-    # Старт
+    # ПРИВЕТСТВИЕ
     if text == "/start":
         user_states.pop(chat_id, None)
         get_user(chat_id)
 
         send_message(
             chat_id,
-            "⚡ VORTEX\n\n"
-            "Твой ИИ-помощник.\n\n"
-            "Создавай посты, придумывай идеи, "
-            "задавай вопросы или отправляй голосовые сообщения 🎙️",
+            "⚡ VORTEX — ТВОЙ ЛИЧНЫЙ ИИ-ПОМОЩНИК\n\n"
+            "Привет! Я VORTEX. Помогаю превращать "
+            "идеи в готовые результаты.\n\n"
+            "✍️ Создаю посты для соцсетей\n"
+            "💡 Генерирую идеи для контента\n"
+            "🧠 Отвечаю на вопросы\n"
+            "🎙️ Распознаю голосовые сообщения\n"
+            "🔥 Улучшаю и редактирую тексты\n\n"
+            "Выбирай функцию в меню или просто напиши мне.\n\n"
+            "VORTEX. Твои идеи. Мои возможности. ⚡",
             keyboard
         )
         return
 
-    # Отмена
+    # ОТМЕНА
     if text in ["/cancel", "❌ Отмена"]:
         user_states.pop(chat_id, None)
         send_message(chat_id, "Действие отменено.", keyboard)
         return
 
-    # Возможности
+    # ВОЗМОЖНОСТИ
     if text == "✨ Возможности":
         send_message(
             chat_id,
@@ -537,7 +542,7 @@ def handle_message(message):
         )
         return
 
-    # Создание поста
+    # СОЗДАНИЕ ПОСТА
     if text == "✍️ Создать пост":
         user_states[chat_id] = {
             "step": "topic"
@@ -554,7 +559,7 @@ def handle_message(message):
         )
         return
 
-    # Идеи
+    # ИДЕИ ДЛЯ КОНТЕНТА
     if text == "💡 Идеи для контента":
         user_states[chat_id] = {
             "step": "ideas"
@@ -571,7 +576,7 @@ def handle_message(message):
         )
         return
 
-    # Профиль
+    # ПРОФИЛЬ
     if text == "👤 Мой профиль":
         user = get_user(chat_id)
         access = check_access(chat_id)
@@ -599,7 +604,7 @@ def handle_message(message):
 
     state = user_states.get(chat_id, {})
 
-    # Тема поста
+    # ТЕМА ПОСТА
     if state.get("step") == "topic":
         user_states[chat_id] = {
             "step": "style",
@@ -613,7 +618,7 @@ def handle_message(message):
         )
         return
 
-    # Стиль поста
+    # СТИЛЬ ПОСТА
     if state.get("step") == "style":
         styles = {
             "💼 Деловой": "деловой и экспертный",
@@ -650,7 +655,7 @@ def handle_message(message):
         send_message(chat_id, answer, keyboard)
         return
 
-    # Генерация идей
+    # ГЕНЕРАЦИЯ ИДЕЙ
     if state.get("step") == "ideas":
         if not can_use_ai(chat_id):
             return
@@ -669,7 +674,7 @@ def handle_message(message):
         send_message(chat_id, answer, keyboard)
         return
 
-    # Обычный чат с ИИ
+    # ОБЫЧНЫЙ ЧАТ
     if not can_use_ai(chat_id):
         return
 
@@ -682,7 +687,7 @@ def handle_message(message):
 
 
 # =========================
-# ЗАПУСК БОТА
+# ЗАПУСК
 # =========================
 
 def main():
@@ -693,8 +698,6 @@ def main():
 
     print("VORTEX запускается...")
 
-    # Бот использует long polling.
-    # Удаляем webhook, чтобы он не конфликтовал с getUpdates.
     try:
         tg_request("deleteWebhook", {
             "drop_pending_updates": "false"
