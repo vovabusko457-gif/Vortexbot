@@ -2,6 +2,8 @@
 import os
 import json
 import time
+import uuid
+import mimetypes
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode
@@ -12,7 +14,10 @@ GROQ_KEY = os.environ["GROQ_API_KEY"]
 
 TG_API = f"https://api.telegram.org/bot{TOKEN}/"
 GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
+
 MODEL = "openai/gpt-oss-20b"
+WHISPER_MODEL = "whisper-large-v3-turbo"
 
 CHANNEL = "@VORTEX_RELAX"
 FREE_REQUESTS = 5
@@ -67,6 +72,7 @@ def save_history():
 
 def load_history():
     global chat_histories
+
     try:
         with open("history.json", "r", encoding="utf-8") as file:
             chat_histories = {
@@ -84,6 +90,7 @@ def save_users():
 
 def load_users():
     global users
+
     try:
         with open("users.json", "r", encoding="utf-8") as file:
             users = json.load(file)
@@ -193,10 +200,7 @@ def check_access(chat_id):
 def can_use_ai(chat_id):
     access = check_access(chat_id)
 
-    if access == "free":
-        return True
-
-    if access in ["trial", "paid"]:
+    if access in ["free", "trial", "paid"]:
         return True
 
     if access == "channel":
@@ -274,13 +278,78 @@ def ask_ai(chat_id, prompt):
         print("Groq HTTP error:", error.code, details)
 
         if error.code == 429:
-            return "Превышен бесплатный лимит ИИ. Попробуй позже."
+            return "Превышен лимит ИИ. Попробуй позже."
 
         return "Не получилось получить ответ от ИИ."
 
     except Exception as error:
         print("Groq error:", error)
         return "Что-то пошло не так. Попробуй ещё раз."
+
+
+# 🎙️ РАСПОЗНАВАНИЕ ГОЛОСОВЫХ СООБЩЕНИЙ
+
+def transcribe_voice(file_id):
+    try:
+        file_info = tg_request("getFile", {
+            "file_id": file_id
+        })
+
+        if not file_info.get("ok"):
+            return None
+
+        file_path = file_info["result"]["file_path"]
+
+        download_url = (
+            f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+        )
+
+        with urllib.request.urlopen(download_url, timeout=60) as response:
+            audio_data = response.read()
+
+        if not audio_data or len(audio_data) > 20 * 1024 * 1024:
+            return None
+
+        boundary = "----VORTEX" + uuid.uuid4().hex
+
+        filename = os.path.basename(file_path) or "voice.ogg"
+        content_type = mimetypes.guess_type(filename)[0] or "audio/ogg"
+
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="model"\r\n\r\n'
+            f"{WHISPER_MODEL}\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode() + audio_data + (
+            f"\r\n--{boundary}--\r\n"
+        ).encode()
+
+        req = urllib.request.Request(
+            GROQ_AUDIO_API,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=90) as response:
+            result = json.loads(response.read())
+
+        recognized = result.get("text", "").strip()
+
+        return recognized if recognized else None
+
+    except urllib.error.HTTPError as error:
+        details = error.read().decode(errors="ignore")
+        print("Whisper HTTP error:", error.code, details)
+        return None
+
+    except Exception as error:
+        print("Voice recognition error:", error)
+        return None
 
 
 def handle_callback(callback):
@@ -331,6 +400,35 @@ def handle_message(message):
     chat_id = message["chat"]["id"]
     text = message.get("text", "").strip()
 
+    # 🎙️ Обработка голосовых сообщений
+    if message.get("voice"):
+        if not can_use_ai(chat_id):
+            return
+
+        send_message(chat_id, "🎙️ VORTEX слушает тебя...")
+
+        file_id = message["voice"]["file_id"]
+        recognized_text = transcribe_voice(file_id)
+
+        if not recognized_text:
+            send_message(
+                chat_id,
+                "❌ Не удалось распознать голосовое.\n"
+                "Попробуй отправить ещё раз.",
+                keyboard
+            )
+            return
+
+        text = recognized_text
+
+        send_message(
+            chat_id,
+            f"📝 Я услышал:\n\n{text}\n\n⚡ Обрабатываю..."
+        )
+
+        # После распознавания голосовое обрабатывается
+        # как обычное сообщение ниже.
+
     if not text:
         return
 
@@ -343,8 +441,8 @@ def handle_message(message):
             chat_id,
             "⚡ VORTEX\n\n"
             "Твой ИИ-помощник.\n\n"
-            "Создавай посты, придумывай идеи "
-            "и задавай любые вопросы.",
+            "Создавай посты, придумывай идеи, "
+            "задавай вопросы или просто отправляй голосовые сообщения 🎙️",
             keyboard
         )
         return
@@ -362,7 +460,8 @@ def handle_message(message):
             "• Идеи для контента\n"
             "• Помощь с текстами\n"
             "• Ответы на вопросы\n"
-            "• Разные стили написания",
+            "• Разные стили написания\n"
+            "• 🎙️ Распознавание голосовых сообщений",
             keyboard
         )
         return
@@ -374,8 +473,10 @@ def handle_message(message):
             chat_id,
             "✍️ На какую тему создаём пост?\n\n"
             "Напиши тему одним сообщением.",
-            {"keyboard": [[{"text": "❌ Отмена"}]],
-             "resize_keyboard": True}
+            {
+                "keyboard": [[{"text": "❌ Отмена"}]],
+                "resize_keyboard": True
+            }
         )
         return
 
@@ -386,8 +487,10 @@ def handle_message(message):
             chat_id,
             "💡 Для какой ниши нужны идеи?\n\n"
             "Например: магазин одежды, техника, спорт.",
-            {"keyboard": [[{"text": "❌ Отмена"}]],
-             "resize_keyboard": True}
+            {
+                "keyboard": [[{"text": "❌ Отмена"}]],
+                "resize_keyboard": True
+            }
         )
         return
 
@@ -446,8 +549,6 @@ def handle_message(message):
         if not can_use_ai(chat_id):
             return
 
-        count_request(chat_id)
-
         topic = state["topic"]
         style = styles[text]
         user_states.pop(chat_id, None)
@@ -461,6 +562,7 @@ def handle_message(message):
             "основной текст и призыв к действию."
         )
 
+        count_request(chat_id)
         send_message(chat_id, answer, keyboard)
         return
 
@@ -468,7 +570,6 @@ def handle_message(message):
         if not can_use_ai(chat_id):
             return
 
-        count_request(chat_id)
         user_states.pop(chat_id, None)
 
         send_message(chat_id, "💡 Подбираю идеи...")
@@ -479,17 +580,18 @@ def handle_message(message):
             f"в нише: {text}. К каждой добавь описание."
         )
 
+        count_request(chat_id)
         send_message(chat_id, answer, keyboard)
         return
 
     if not can_use_ai(chat_id):
         return
 
-    count_request(chat_id)
-
     send_message(chat_id, "⚡ Думаю над ответом...")
 
     answer = ask_ai(chat_id, text)
+
+    count_request(chat_id)
     send_message(chat_id, answer, keyboard)
 
 
