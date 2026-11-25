@@ -175,7 +175,6 @@ def get_user(chat_id):
 
     user = users[key]
 
-    # Добавляем поля пользователям из старой базы
     user.setdefault("requests", 0)
     user.setdefault("trial_until", None)
     user.setdefault("paid_until", None)
@@ -373,10 +372,8 @@ def activate_premium(message):
         return
 
     user = get_user(chat_id)
-
     charges = user.get("payment_charges", [])
 
-    # Защита от повторной обработки одного платежа
     if charge_id in charges:
         print("Duplicate payment ignored:", charge_id)
         return
@@ -384,8 +381,6 @@ def activate_premium(message):
     now = datetime.now(timezone.utc)
     old_paid_until = parse_date(user.get("paid_until"))
 
-    # Новая подписка начинается после действующей,
-    # если она ещё не закончилась
     start = now
 
     if old_paid_until and old_paid_until > now:
@@ -568,6 +563,110 @@ def ask_ai(chat_id, prompt):
 
 
 # =========================
+# УМНОЕ ПОНИМАНИЕ ЗАПРОСОВ ДЛЯ КАРТИНОК
+# =========================
+
+def prepare_image_prompt(user_idea):
+    system_prompt = """
+You are VORTEX, an expert AI image prompt engineer.
+
+Convert the user's idea into a detailed English image-generation prompt.
+
+The goal is to visualize exactly what the user imagines.
+
+STRICT RULES:
+
+1. The main object requested by the user MUST be the
+   central and clearly visible subject of the image.
+
+2. NEVER replace the requested object with scenery,
+   sky, background or unrelated objects.
+
+3. Preserve every explicitly requested detail:
+   objects, brands, models, colors, locations, actions,
+   camera angles, atmosphere and artistic style.
+
+4. If the user gives a short idea, intelligently add
+   suitable visual details, composition, lighting,
+   environment and camera perspective.
+
+5. Never contradict the user's idea.
+
+6. Do not invent a specific car model, color, brand
+   variant or other important detail if it was not specified.
+
+7. Describe the main subject FIRST.
+   Describe the environment SECOND.
+   Describe lighting, camera and style THIRD.
+
+8. The main subject must occupy a significant part
+   of the image and be easy to recognize.
+
+9. Avoid irrelevant scenery and empty backgrounds.
+
+10. Do not add text, watermarks, captions or logos
+    unless explicitly requested.
+
+11. If the user requests a realistic image,
+    use photorealistic photography language.
+
+12. Return ONLY the final English prompt.
+    No explanations, no introductions.
+"""
+
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_idea
+            }
+        ],
+        "temperature": 0.4,
+        "max_completion_tokens": 500
+    }
+
+    req = urllib.request.Request(
+        GROQ_API,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_KEY}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read())
+
+        improved = (
+            result["choices"][0]["message"]["content"].strip()
+        )
+
+        if not improved:
+            return user_idea
+
+        print("Original image idea:", user_idea)
+        print("Improved image prompt:", improved)
+
+        return improved[:2048]
+
+    except urllib.error.HTTPError as error:
+        details = error.read().decode(errors="ignore")
+        print("Image prompt Groq HTTP error:", error.code, details)
+        return user_idea
+
+    except Exception as error:
+        print("Image prompt improvement error:", error)
+        return user_idea
+
+
+# =========================
 # ГЕНЕРАЦИЯ КАРТИНОК CLOUDFLARE
 # =========================
 
@@ -576,9 +675,16 @@ def generate_image(prompt):
         print("Cloudflare credentials are missing")
         return None
 
+    # Этап 1. Groq превращает задумку в подробный промпт
+    original_prompt = prompt
+    prompt = prepare_image_prompt(original_prompt)
+
     if len(prompt) > 2048:
         prompt = prompt[:2048]
 
+    print("Final Flux prompt:", prompt)
+
+    # Этап 2. Flux создаёт изображение
     payload = {
         "prompt": prompt,
         "steps": 4
@@ -770,7 +876,6 @@ def handle_callback(callback):
 def handle_message(message):
     chat_id = message["chat"]["id"]
 
-    # СНАЧАЛА ОБРАБАТЫВАЕМ УСПЕШНУЮ ОПЛАТУ
     if message.get("successful_payment"):
         activate_premium(message)
         return
@@ -916,7 +1021,7 @@ def handle_message(message):
             "Например:\n"
             "«Футуристический город ночью, "
             "неоновые вывески, дождь, кинематографичный стиль»\n\n"
-            "Чем подробнее описание, тем лучше результат.",
+            "Можешь писать даже коротко. Я сам дополню детали.",
             {
                 "keyboard": [[{"text": "❌ Отмена"}]],
                 "resize_keyboard": True
@@ -1011,8 +1116,8 @@ def handle_message(message):
 
         send_message(
             chat_id,
-            "🎨 VORTEX создаёт изображение...\n\n"
-            "Это может занять некоторое время."
+            "🎨 VORTEX анализирует твою задумку и создаёт изображение...\n\n"
+            "Сначала я продумываю сцену, затем рисую её. Это займёт немного времени."
         )
 
         image_data = generate_image(text)
