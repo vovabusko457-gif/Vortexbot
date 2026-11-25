@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -762,27 +761,35 @@ IMPORTANT:
     )
 
 
+def get_cloudflare_edit_error(details):
+    try:
+        error_data = json.loads(details)
+    except (json.JSONDecodeError, TypeError):
+        return "cloudflare"
+
+    errors = error_data.get("errors", [])
+
+    for item in errors:
+        if item.get("code") == 3030:
+            return "blocked"
+
+    return "cloudflare"
+
+
 def edit_image(image_data, instruction):
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         print("Cloudflare credentials are missing")
-        return None
+        return None, "configuration"
 
     try:
-        # Открываем оригинальное фото
         image = Image.open(io.BytesIO(image_data))
         image.load()
 
-        print(
-            "Original image:",
-            image.format,
-            image.size
-        )
+        print("Original image:", image.format, image.size)
 
-        # Учитываем ориентацию фотографии из EXIF
         from PIL import ImageOps
         image = ImageOps.exif_transpose(image)
 
-        # Переводим изображение в RGB
         if image.mode != "RGB":
             if image.mode in ("RGBA", "LA"):
                 rgba = image.convert("RGBA")
@@ -795,7 +802,6 @@ def edit_image(image_data, instruction):
             else:
                 image = image.convert("RGB")
 
-        # Cloudflare требует входное изображение меньше 512x512
         image.thumbnail((511, 511), Image.Resampling.LANCZOS)
 
         width, height = image.size
@@ -864,30 +870,38 @@ def edit_image(image_data, instruction):
 
         if not result.get("success", False):
             print("Cloudflare edit error:", result)
-            return None
+
+            for item in result.get("errors", []):
+                if item.get("code") == 3030:
+                    return None, "blocked"
+
+            return None, "cloudflare"
 
         image_base64 = result.get("result", {}).get("image")
 
         if not image_base64:
             print("Cloudflare edit returned no image:", result)
-            return None
+            return None, "cloudflare"
 
         edited_data = base64.b64decode(image_base64)
 
         if not edited_data:
             print("Edited image is empty")
-            return None
+            return None, "cloudflare"
 
-        return edited_data
+        return edited_data, None
 
     except urllib.error.HTTPError as error:
         details = error.read().decode(errors="ignore")
         print("Cloudflare edit HTTP error:", error.code, details)
-        return None
+
+        error_type = get_cloudflare_edit_error(details)
+
+        return None, error_type
 
     except Exception as error:
         print("Cloudflare edit error:", error)
-        return None
+        return None, "technical"
 
 
 # =========================
@@ -930,8 +944,6 @@ def handle_photo_edit(message):
         send_message(chat_id, "❌ Не удалось получить фотографию.")
         return
 
-    # Берём самое большое качество, которое прислал Telegram.
-    # Затем уменьшаем его до нужного размера в edit_image().
     selected_photo = max(
         photos,
         key=lambda item: (
@@ -964,15 +976,37 @@ def handle_photo_edit(message):
             len(image_data)
         )
 
-        edited = edit_image(image_data, caption)
+        edited, error_type = edit_image(image_data, caption)
 
         if not edited:
-            send_message(
-                chat_id,
-                "❌ Не удалось отредактировать фото.\n\n"
-                "Посмотри ошибку Cloudflare в логах Railway.",
-                keyboard
-            )
+            if error_type == "blocked":
+                error_text = (
+                    "⚠️ Cloudflare не разрешил обработать эту фотографию "
+                    "с такой командой.\n\n"
+                    "Попробуй другое фото или измени запрос. "
+                    "Некоторые изображения и запросы могут блокироваться "
+                    "защитными фильтрами сервиса."
+                )
+
+            elif error_type == "configuration":
+                error_text = (
+                    "❌ Не настроено подключение к Cloudflare. "
+                    "Проверь переменные в Railway."
+                )
+
+            elif error_type == "cloudflare":
+                error_text = (
+                    "❌ Cloudflare не смог обработать изображение.\n\n"
+                    "Попробуй ещё раз немного позже."
+                )
+
+            else:
+                error_text = (
+                    "❌ Произошла техническая ошибка при обработке фото.\n\n"
+                    "Попробуй отправить изображение ещё раз."
+                )
+
+            send_message(chat_id, error_text, keyboard)
             return
 
         send_photo(
