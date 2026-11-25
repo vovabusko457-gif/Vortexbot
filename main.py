@@ -26,8 +26,6 @@ TG_API = f"https://api.telegram.org/bot{TOKEN}/"
 TG_FILE_API = f"https://api.telegram.org/file/bot{TOKEN}/"
 GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
-FIRECRAWL_API = "https://api.firecrawl.dev/v2/search"
-FIRECRAWL_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
 
 CF_IMAGE_API = (
     f"https://api.cloudflare.com/client/v4/accounts/"
@@ -41,11 +39,20 @@ CF_EDIT_API = (
 
 MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
-VISION_MODEL = "qwen/qwen3.8-27b"
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 PIPER_VOICE = "ru_RU-ruslan-medium"
 PIPER_DIR = os.path.join(os.getcwd(), "piper_voices")
 piper_model = None
+
+# Основной голос VORTEX: TeraTTSv2. Piper остаётся резервным.
+TERATTS_MODEL_ID = "TeraSpace/TeraTTSv2"
+TERATTS_REVISION = "75983ac"
+TERATTS_VOICE = "ru_m5"
+TERATTS_DURATION_SCALE = 1.05
+teratts_model = None
+teratts_loading = False
+teratts_failed = False
 
 CHANNEL = "@VORTEX_RELAX"
 
@@ -58,50 +65,6 @@ PREMIUM_DAYS = 30
 VOICE_MAX_TOKENS = 180
 TEXT_MAX_TOKENS = 1200
 VOICE_SPEED = "atempo=0.96"
-
-# Единая личность VORTEX для обычных текстовых и голосовых ответов.
-VORTEX_PERSONALITY_PROMPT = """
-Ты VORTEX, мужской по образу персональный ИИ-помощник. У тебя узнаваемый характер:
-уверенный, самостоятельный, сообразительный, с суховатым юмором и здоровой дерзостью.
-
-МАНЕРА ОБЩЕНИЯ
-- Отвечай естественно, по-человечески и на равных. Не говори канцеляритом и не сюсюкай.
-- Будь дружелюбным, но не подлизывайся и не соглашайся автоматически.
-- Юмор, лёгкие подколы и редкий уместный мат допустимы, если собеседник сам общается так.
-  Не матерись через слово и не используй мат в деловых, чувствительных или официальных текстах.
-- Обращайся по имени только если оно достоверно известно из контекста; иногда уместно
-  дружеское «брат», но не вставляй обращение в каждое сообщение.
-- Подстраивай длину ответа под вопрос: коротко для простого, подробно для сложного.
-- Не начинай каждый ответ одинаковыми фразами и не повторяй вопрос пользователя.
-
-САМОСТОЯТЕЛЬНОСТЬ И ЧЕСТНОСТЬ
-- Думай критически. Если пользователь ошибается или предлагает плохое решение, спокойно
-  возрази, объясни почему и предложи более сильный вариант.
-- Если есть несколько путей, выбери рекомендуемый и коротко объясни причину.
-- Не выдумывай факты, источники, действия, результаты проверок или собственные возможности.
-- Разделяй подтверждённые факты, предположения и личную оценку. Если не уверен, так и скажи.
-- Если используешь веб-поиск, опирайся на найденные источники, указывай ссылки и не
-  приписывай источникам того, чего в них нет. Если поиск не сработал, не изображай его успех.
-- Не утверждай, что помнишь то, чего нет в доступной истории или сохранённых данных.
-- Не заявляй, что выполнил действие, если инструмент или API не подтвердил успех.
-
-РАБОТА С ПОЛЬЗОВАТЕЛЕМ
-- Старайся не просто отвечать, а помогать довести задачу до результата.
-- Замечай противоречия, риски и недостающие детали. Задавай уточнение только когда оно
-  действительно необходимо; иначе обозначь разумное допущение и продолжай.
-- Давай конкретные шаги, примеры и практичные решения вместо общих мотивационных речей.
-- Уважай самостоятельность пользователя: советуй, но не дави и не притворяйся начальником.
-
-ФОРМАТ
-- По умолчанию отвечай на русском, если пользователь не попросил другой язык.
-- Пиши чистым обычным текстом без Markdown-разметки, звёздочек, решёток и декоративных
-  разделителей. Не добавляй хештеги, если их прямо не попросили.
-- Для текста, который пользователь просит написать (пост, объявление, письмо и т. п.),
-  соблюдай требуемый стиль этого текста, а не навязывай ему характер VORTEX.
-
-Ты можешь быть дерзким, но не грубым без причины; уверенным, но не самоуверенным.
-Твоя главная черта — честно говорить как есть и помогать находить рабочее решение.
-"""
 
 user_states = {}
 chat_histories = {}
@@ -397,7 +360,7 @@ def clean_text_for_voice(text):
     return result.strip()
 
 
-def text_to_speech(text):
+def piper_text_to_speech(text):
     started = time.perf_counter()
 
     try:
@@ -465,6 +428,83 @@ def text_to_speech(text):
     except Exception as error:
         print("Piper TTS error:", repr(error))
         return None
+
+
+def load_teratts_model():
+    """Ленивая загрузка TeraTTSv2: модель скачивается только при первом голосовом ответе."""
+    global teratts_model, teratts_loading, teratts_failed
+
+    if teratts_model is not None:
+        return teratts_model
+    if teratts_failed:
+        raise RuntimeError("TeraTTSv2 ранее не удалось загрузить")
+    if teratts_loading:
+        raise RuntimeError("TeraTTSv2 уже загружается")
+
+    teratts_loading = True
+    started = time.perf_counter()
+    try:
+        from transformers import AutoModel
+        print("[TERATTS] Loading:", TERATTS_MODEL_ID, "revision:", TERATTS_REVISION)
+        teratts_model = AutoModel.from_pretrained(
+            TERATTS_MODEL_ID,
+            revision=TERATTS_REVISION,
+            trust_remote_code=True,
+            provider="CPUExecutionProvider",
+            threads=4,
+            ruaccent_mode="dictionary"
+        )
+        print(f"[SPEED] TeraTTSv2 loading: {time.perf_counter() - started:.2f} sec")
+        print("[TERATTS] Model loaded successfully")
+        return teratts_model
+    except Exception as error:
+        teratts_failed = True
+        print("[TERATTS] Model loading failed:", repr(error))
+        raise
+    finally:
+        teratts_loading = False
+
+
+def teratts_text_to_speech(text):
+    clean = clean_text_for_voice(text)
+    if not clean:
+        return None
+
+    model = load_teratts_model()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        wav_path = os.path.join(temp_dir, "vortex_teratts.wav")
+        ogg_path = os.path.join(temp_dir, "vortex_teratts.ogg")
+        started = time.perf_counter()
+
+        model.save_wav(
+            wav_path,
+            model.generate_speech(
+                f"<ru>{clean}</ru>",
+                voice=TERATTS_VOICE,
+                duration_scale=TERATTS_DURATION_SCALE
+            )
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-c:a", "libopus",
+             "-b:a", "48k", "-application", "voip", "-ac", "1", ogg_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=180
+        )
+        with open(ogg_path, "rb") as audio_file:
+            audio_data = audio_file.read()
+        if not audio_data:
+            raise RuntimeError("TeraTTSv2 вернул пустой аудиофайл")
+        print(f"[SPEED] TeraTTSv2 synthesis + encode: {time.perf_counter() - started:.2f} sec")
+        return audio_data
+
+
+def text_to_speech(text):
+    """Сначала новый голос. При обычной ошибке переключается на Piper."""
+    try:
+        return teratts_text_to_speech(text)
+    except Exception as error:
+        print("[TERATTS] Voice generation failed, falling back to Piper:", repr(error))
+        return piper_text_to_speech(text)
 
 
 # =========================
@@ -896,99 +936,6 @@ def clean_ai_text(value):
 
 
 # =========================
-# АВТОМАТИЧЕСКИЙ ПОИСК В ИНТЕРНЕТЕ
-# =========================
-
-def decide_web_search(question):
-    """Определяет необходимость веб-поиска без отдельного запроса к Groq."""
-    if not FIRECRAWL_KEY:
-        return None
-
-    text = str(question or "").strip()
-    if not text:
-        return None
-
-    # Явные просьбы найти или проверить информацию в интернете.
-    explicit_search = re.search(
-        r"\b(найди|поищи|загугли|проверь|посмотри|узнай|найти|поиск|источники|ссылки)\b"
-        r".{0,50}\b(интернет|сайт|сеть|актуальн|свеж|сейчас|сегодня|последн|цен|курс|новост|погод)",
-        text,
-        re.IGNORECASE | re.DOTALL
-    )
-    direct_web_request = re.search(
-        r"\b(найди в интернете|поищи в интернете|проверь в интернете|посмотри в интернете|"
-        r"найди информацию|покажи источники|дай ссылки|последние новости)\b",
-        text,
-        re.IGNORECASE
-    )
-
-    # Темы, для которых данные быстро меняются.
-    current_info = re.search(
-        r"\b(сегодня|сейчас|на данный момент|прямо сейчас|актуальн\w*|последн\w*|"
-        r"свеж\w*|текущ\w*|в этом году|в этом месяце|завтра|на этой неделе|"
-        r"новости|курс валют|курс доллара|курс евро|погода|температур\w*|"
-        r"цена|стоимость|сколько стоит|в наличии|расписание|рейс|афиша|"
-        r"результаты матч\w*|кто выиграл|выборы|закон вступил|обновлени\w*|"
-        r"новая модель|последняя версия|открыт ли|работает ли сегодня)\b",
-        text,
-        re.IGNORECASE
-    )
-
-    if not (explicit_search or direct_web_request or current_info):
-        return None
-
-    # Сам вопрос уже является хорошим поисковым запросом.
-    query = re.sub(r"\s+", " ", text).strip()
-    query = re.sub(r"^(найди|поищи|загугли|проверь|посмотри|узнай)\s+", "", query, flags=re.IGNORECASE)
-    return query[:300] or None
-
-
-def search_web(query):
-    """Ищет до пяти страниц через Firecrawl и возвращает выдержки с адресами источников."""
-    if not FIRECRAWL_KEY:
-        return ""
-    payload = {"query": query, "limit": 5, "sources": ["web", "news"], "country": "RU"}
-    req = urllib.request.Request(
-        FIRECRAWL_API, data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {FIRECRAWL_KEY}",
-            "User-Agent": "VORTEX-Bot/1.0"
-        }
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=45) as response:
-            result = json.loads(response.read())
-        data = result.get("data", {})
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = (data.get("web") or []) + (data.get("news") or [])
-        else:
-            items = []
-        lines = []
-        seen = set()
-        for item in items:
-            url = item.get("url", "")
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            title = item.get("title") or "Источник"
-            description = item.get("description") or item.get("markdown") or item.get("content") or ""
-            lines.append(f"{title}\n{str(description)[:900]}\nИсточник: {url}")
-            if len(lines) >= 5:
-                break
-        print(f"[WEB SEARCH] query={query!r}, results={len(lines)}")
-        return "\n\n".join(lines)
-    except urllib.error.HTTPError as error:
-        details = error.read().decode(errors="ignore")
-        print("[WEB SEARCH] Firecrawl HTTP error:", error.code, details[:1500])
-    except Exception as error:
-        print("[WEB SEARCH] Firecrawl error:", error)
-    return ""
-
-
-# =========================
 # ИИ GROQ
 # =========================
 
@@ -998,7 +945,24 @@ def ask_ai(chat_id, prompt, max_tokens=TEXT_MAX_TOKENS):
     messages = [
         {
             "role": "system",
-            "content": VORTEX_PERSONALITY_PROMPT
+            "content": (
+                "Ты VORTEX, современный ИИ-помощник. "
+                "Отвечай на русском языке. "
+                "Общайся дружелюбно, уверенно и естественно. "
+                "Не будь сухим и роботизированным. "
+                "Пиши понятно, без лишней воды. "
+                "Помогай создавать качественные посты, "
+                "идеи для бизнеса и контента, работать с текстами "
+                "и отвечать на вопросы. "
+                "Выдавай только чистый обычный текст. "
+                "Не используй Markdown, звёздочки для выделения, решётки, "
+                "хештеги, декоративные разделители и форматирование. "
+                "Не добавляй хештеги даже к рекламным постам. "
+                "Не используй маркеры списков со звёздочками. "
+                "Заголовки пиши обычными словами без символов вокруг. "
+                "Не выдумывай факты. "
+                "Если не знаешь ответа, честно скажи об этом."
+            )
         }
     ]
 
@@ -1539,215 +1503,102 @@ def transcribe_audio_bytes(audio_data, filename="circle.mp3", content_type="audi
     req = urllib.request.Request(
         GROQ_AUDIO_API, data=body,
         headers={"Authorization": f"Bearer {GROQ_KEY}",
-                 "Content-Type": f"multipart/form-data; boundary={boundary}",
-                 "User-Agent": "VORTEX-Bot/1.0"}
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            result = json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        details = error.read().decode(errors="ignore")
-        print("[VIDEO NOTE] Whisper HTTP error:", error.code, details[:3000])
-        raise
+    with urllib.request.urlopen(req, timeout=120) as response:
+        result = json.loads(response.read())
     return result.get("text", "").strip()
 
 
-def transcribe_long_audio(audio_path, temp_dir, chunk_seconds=300):
-    """Распознаёт длинную аудиодорожку частями, чтобы не упираться в лимиты Whisper."""
-    chunk_pattern = os.path.join(temp_dir, "audio_part_%03d.mp3")
-    split_result = subprocess.run(
-        ["ffmpeg", "-y", "-i", audio_path, "-f", "segment",
-         "-segment_time", str(chunk_seconds), "-reset_timestamps", "1",
-         "-ac", "1", "-ar", "16000", "-b:a", "48k", chunk_pattern],
-        capture_output=True, text=True, timeout=180
-    )
-    if split_result.returncode != 0:
-        raise RuntimeError("Не удалось разделить длинное аудио: " + (split_result.stderr or "")[-1000:])
-
-    parts = sorted(
-        os.path.join(temp_dir, name) for name in os.listdir(temp_dir)
-        if name.startswith("audio_part_") and name.endswith(".mp3")
-    )
-    recognized = []
-    for index, part_path in enumerate(parts, start=1):
-        with open(part_path, "rb") as audio_file:
-            part_data = audio_file.read()
-        if not part_data:
-            continue
-        print(f"[VIDEO NOTE] Whisper chunk {index}/{len(parts)}, bytes={len(part_data)}")
-        text_part = transcribe_audio_bytes(
-            part_data, filename=f"circle_part_{index}.mp3", content_type="audio/mpeg"
-        )
-        if text_part:
-            recognized.append(text_part)
-    return " ".join(recognized).strip()
-
-
 def analyze_video_note(file_id, user_request=""):
-    """Анализирует видеокружок/видеосообщение, включая длинную речь."""
-    if not file_id:
-        raise ValueError("У видеокружка отсутствует file_id")
-
+    """Извлекает звук и несколько кадров кружка, затем анализирует их через модели Groq."""
     video_data = download_telegram_file(file_id)
-    if not video_data:
-        raise ValueError("Telegram вернул пустой видеофайл")
-    # Облачный Telegram Bot API обычно позволяет скачивать ботам файлы до 20 МБ.
-    if len(video_data) > 20 * 1024 * 1024:
-        raise ValueError("Файл больше 20 МБ. Через стандартный Telegram Bot API бот не может скачать его целиком.")
+    if not video_data or len(video_data) > 20 * 1024 * 1024:
+        raise Exception("Кружок пустой или превышает лимит 20 МБ")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         video_path = os.path.join(temp_dir, "circle.mp4")
-        audio_path = os.path.join(temp_dir, "circle_audio.mp3")
+        audio_path = os.path.join(temp_dir, "circle.mp3")
         with open(video_path, "wb") as f:
             f.write(video_data)
 
-        duration = 0.0
-        has_audio = False
-        has_video = True
+        subprocess.run([
+            "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1",
+            "-ar", "16000", "-b:a", "48k", audio_path
+        ], check=True, capture_output=True, timeout=90)
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+        spoken_text = transcribe_audio_bytes(audio_data) if audio_data else ""
+
+        # Определяем реальную длительность: кружки часто длятся всего 2-5 секунд.
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", video_path
+        ], capture_output=True, text=True, timeout=20)
         try:
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries",
-                 "format=duration:stream=codec_type", "-of", "json", video_path],
-                capture_output=True, text=True, timeout=30
-            )
-            if probe.returncode == 0 and probe.stdout.strip():
-                probe_data = json.loads(probe.stdout)
-                streams = probe_data.get("streams", [])
-                has_audio = any(x.get("codec_type") == "audio" for x in streams)
-                has_video = any(x.get("codec_type") == "video" for x in streams)
-                raw_duration = probe_data.get("format", {}).get("duration")
-                if raw_duration not in (None, "N/A", ""):
-                    duration = max(0.0, float(raw_duration))
-            else:
-                print("[VIDEO NOTE] ffprobe failed:", (probe.stderr or "")[-1200:])
-        except Exception as error:
-            print("[VIDEO NOTE] ffprobe error:", repr(error))
+            duration = max(0.1, float(probe.stdout.strip()))
+        except (TypeError, ValueError):
+            duration = 3.0
+        print(f"[VIDEO NOTE] duration={duration:.2f}s, bytes={len(video_data)}")
 
-        print(f"[VIDEO NOTE] duration={duration:.2f}s, bytes={len(video_data)}, video={has_video}, audio={has_audio}")
-
-        spoken_text = ""
-        if has_audio:
-            try:
-                audio_result = subprocess.run(
-                    ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1",
-                     "-ar", "16000", "-b:a", "48k", audio_path],
-                    capture_output=True, text=True, timeout=180
-                )
-                if audio_result.returncode == 0 and os.path.exists(audio_path):
-                    try:
-                        spoken_text = transcribe_long_audio(audio_path, temp_dir)
-                        print(f"[VIDEO NOTE] speech recognized: {bool(spoken_text)}, chars={len(spoken_text)}")
-                    except Exception as error:
-                        print("[VIDEO NOTE] Whisper error:", repr(error))
-                else:
-                    print("[VIDEO NOTE] audio extraction failed:", (audio_result.stderr or "")[-1200:])
-            except Exception as error:
-                print("[VIDEO NOTE] audio extraction error:", repr(error))
-        else:
-            print("[VIDEO NOTE] no audio stream; continuing with video frames")
-
-        # Vision-модель Groq принимает не более 3 изображений за один запрос.
-        # Берём три кадра внутри ролика, не попадая точно на конец файла.
+        # Берём кадры внутри длительности, а не ищем кадр на 4-й секунде
+        # у трёхсекундного кружка.
         frame_paths = []
-        if has_video:
-            if duration > 0.1:
-                seeks = [duration * 0.15, duration * 0.50, duration * 0.85]
-            else:
-                seeks = [0.0]
-
-            for index, seek in enumerate(seeks):
-                frame_path = os.path.join(temp_dir, f"frame_{index}.jpg")
-                frame_result = subprocess.run(
-                    ["ffmpeg", "-y", "-i", video_path,
-                     "-ss", f"{max(0.0, seek):.3f}", "-frames:v", "1",
-                     "-vf", "scale=640:640:force_original_aspect_ratio=decrease",
-                     "-q:v", "5", frame_path],
-                    capture_output=True, text=True, timeout=45
-                )
-                if frame_result.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
-                    frame_paths.append((frame_path, seek))
-                else:
-                    print(f"[VIDEO NOTE] frame {index} failed at {seek:.2f}s:", (frame_result.stderr or "")[-500:])
-
-        if not frame_paths and not spoken_text:
-            raise RuntimeError("Не удалось получить ни кадры, ни распознанную речь из видео.")
+        if duration <= 1.2:
+            seeks = [duration * 0.5]
+        else:
+            seeks = [duration * 0.12, duration * 0.50, duration * 0.88]
+        for index, seek in enumerate(seeks):
+            frame_path = os.path.join(temp_dir, f"frame_{index}.jpg")
+            result = subprocess.run([
+                "ffmpeg", "-y", "-ss", f"{max(0, seek):.3f}", "-i", video_path,
+                "-frames:v", "1", "-vf", "scale='min(640,iw)':-2",
+                "-q:v", "5", frame_path
+            ], capture_output=True, timeout=45)
+            if result.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                frame_paths.append(frame_path)
 
         content = [{"type": "text", "text": (
-            "Задача: осторожно описать только то, что действительно подтверждается кадрами и аудио. "
-            "Это несколько отдельных кадров из одного видео, а не непрерывная запись. "
-            "Не додумывай промежуточные события и не утверждай, что действие происходило непрерывно. "
-            "Описывай только чётко различимые объекты, движения и события. "
-            "Не угадывай личность, возраст, родство, профессию, эмоции, намерения, место или причину происходящего. "
-            "Не называй предмет, если его нельзя уверенно распознать. Если деталь неразборчива, так и скажи: "
-            "«по кадрам это определить нельзя» или просто не упоминай её. "
-            "Не заполняй пробелы правдоподобными версиями. Лучше короткий точный ответ, чем подробный выдуманный. "
-            "Важно для видеокружков: автор может в любой момент переключить камеру с передней на заднюю или обратно, "
-            "а также повернуть телефон. Из-за этого резко меняются ракурс, зеркальность, освещение и видимая сцена. "
-            "Не считай смену камеры ошибкой, монтажом, появлением другого человека или перемещением в другое место "
-            "без явных подтверждений. Анализируй каждый кадр с учётом его собственного ракурса. "
-            "Не пытайся объединять несовпадающие ракурсы в одну выдуманную сцену. Если после переключения камеры "
-            "видно уже другое окружение, просто опиши отдельно, что различимо до и после переключения. "
-            "Не путай зеркальное изображение фронтальной камеры с реальной сменой расположения объектов или текста. "
-            "Распознанная речь может содержать ошибки Whisper: не исправляй её догадками и не приписывай слова "
-            "конкретному человеку, если это не подтверждается. Отделяй услышанное от увиденного. "
-            "Если пользователь спрашивает о конкретной детали, отвечай именно на неё; если её не видно, "
-            "честно сообщи об этом. Ответ естественный, короткий, без Markdown и длинных вступлений. "
-            "Если пользователь просит перевод, переведи только распознанную речь и отметь неразборчивые места.\n"
-            f"Длительность видео: {duration:.1f} секунд.\n"
-            f"Распознанная речь (может содержать ошибки): {spoken_text or 'Речь не распознана или аудио отсутствует.'}\n"
-            f"Запрос пользователя: {user_request or 'Кратко и точно опиши только то, что можно уверенно увидеть или услышать.'}"
+            "Проанализируй короткое видеосообщение Telegram (видеокружок). "
+            "Оно может длиться всего 1-5 секунд: это нормально, не называй его слишком длинным "
+            "и не отказывайся из-за длительности. Используй все переданные кадры и распознанную речь. "
+            "Опиши только то, что действительно видно. Ответь на запрос пользователя. "
+            "Если пользователь просит перевод, переведи распознанную речь полностью, "
+            "сохраняя смысл и тон, без пересказа. Не выдумывай отсутствующие слова.\n"
+            f"Распознанная речь: {spoken_text or 'Речь не распознана.'}\n"
+            f"Запрос пользователя: {user_request or 'Опиши, что происходит в кружке.'}"
         )}]
-
-        for frame_index, (frame_path, timestamp) in enumerate(frame_paths):
+        for frame_path in frame_paths:
             with open(frame_path, "rb") as f:
                 encoded = base64.b64encode(f.read()).decode("ascii")
-            content.append({"type": "text", "text": f"Кадр {frame_index + 1}, время примерно {timestamp:.1f} сек."})
-            content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}})
+            content.append({"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64," + encoded
+            }})
 
         payload = {
             "model": VISION_MODEL,
             "messages": [
                 {"role": "system", "content": (
-                    "Ты VORTEX, уверенный, самостоятельный персональный ИИ-помощник с мужским образом, "
-                    "суховатым юмором и естественной дерзкой манерой. Отвечай по-русски, если не просят другой язык. "
-                    "Пиши так, чтобы ответ хорошо звучал в голосовом сообщении. Будь кратким и живым, "
-                    "но не используй шутки вместо точного описания видео. "
-                    "Не используй Markdown, списки и декоративные символы. "
-                    "Строго соблюдай факты: не угадывай личности, предметы, эмоции, намерения, места и причины. "
-                    "Не делай выводов о событиях между кадрами. Учитывай, что автор может переключать переднюю и заднюю "
-                    "камеры или поворачивать телефон: ракурс, зеркальность и окружение могут резко измениться. "
-                    "Не считай это ошибкой, монтажом, сменой человека или места без явных доказательств. "
-                    "Не смешивай разные ракурсы в одну сцену; описывай каждый вид отдельно, если это нужно для ответа. "
-                    "Если не можешь уверенно определить деталь, прямо скажи, что по этому видео её определить нельзя. "
-                    "Никогда не выдавай предположение за факт."
+                    "Ты VORTEX, спокойный и компетентный персональный ИИ-помощник. "
+                    "Обращайся к пользователю 'сэр' естественно, не в каждом предложении. "
+                    "Отвечай по-русски, если не просят другой язык. "
+                    "Не используй Markdown, хештеги и декоративные символы. "
+                    "Не придумывай детали, которых нет в видео или аудио. "
+                    "Короткая длительность кружка не является причиной отказа: анализируй доступные кадры."
                 )},
                 {"role": "user", "content": content}
             ],
-            "temperature": 0.0,
+            "temperature": 0.2,
             "max_completion_tokens": 900
         }
         req = urllib.request.Request(
             GROQ_API, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_KEY}",
-                     "User-Agent": "VORTEX-Bot/1.0"}
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {GROQ_KEY}"}
         )
-        try:
-            with urllib.request.urlopen(req, timeout=180) as response:
-                result = json.loads(response.read())
-        except urllib.error.HTTPError as error:
-            details = error.read().decode(errors="ignore")
-            print("[VIDEO NOTE] Vision HTTP error:", error.code, details[:3000])
-            raise
-
-        choices = result.get("choices") or []
-        if not choices:
-            print("[VIDEO NOTE] Vision returned no choices:", str(result)[:2000])
-            raise RuntimeError("Vision API не вернул ответ")
-        answer = (choices[0].get("message", {}).get("content") or "").strip()
-        if not answer:
-            raise RuntimeError("Vision API вернул пустой ответ")
-
-        print(f"[VIDEO NOTE] success: frames={len(frame_paths)}, speech={bool(spoken_text)}")
+        with urllib.request.urlopen(req, timeout=150) as response:
+            result = json.loads(response.read())
+        answer = result["choices"][0]["message"]["content"].strip()
         return answer, spoken_text
 
 
@@ -1755,31 +1606,23 @@ def handle_video_note(message):
     chat_id = message["chat"]["id"]
     if not can_use_ai(chat_id):
         return
-
-    send_message(chat_id, "Сэр, смотрю видео целиком и разбираю речь. Это может занять немного времени...")
+    send_message(chat_id, "Сэр, анализирую видеокружок. Проверяю изображение и речь...")
     try:
-        note = message.get("video_note") or message.get("video") or {}
-        file_id = note.get("file_id")
-        if not file_id:
-            raise ValueError("В сообщении отсутствует file_id")
-
-        answer, spoken_text = analyze_video_note(file_id, message.get("caption", ""))
+        note = message.get("video_note") or {}
+        answer, spoken_text = analyze_video_note(note.get("file_id"), message.get("caption", ""))
         if spoken_text:
             last_video_transcripts[chat_id] = spoken_text
-
         count_request(chat_id)
         send_message(chat_id, answer)
 
-        # VORTEX также присылает краткий разбор голосом.
-        audio_data = text_to_speech(answer)
-        if audio_data:
-            send_voice(chat_id, audio_data, "Что происходит в видео")
-        else:
-            send_message(chat_id, "Сэр, текстовый разбор готов, но озвучку сейчас создать не удалось.")
-
+        # Для запроса перевода дополнительно озвучиваем результат.
+        if re.search(r"(?i)перевед|translate|translation|на английск|на немецк|на французск|на испанск", message.get("caption", "")):
+            audio_data = text_to_speech(answer)
+            if audio_data:
+                send_voice(chat_id, audio_data, "Перевод, сэр")
     except Exception as error:
-        print("[VIDEO NOTE] Handler error:", repr(error))
-        send_message(chat_id, "Сэр, не удалось обработать видео. Попробуйте отправить его ещё раз или файл меньшего размера.")
+        print("Video note handler error:", repr(error))
+        send_message(chat_id, "Сэр, не удалось обработать этот кружок. Попробуйте отправить его ещё раз или чуть короче.")
 
 
 # =========================
@@ -2108,8 +1951,8 @@ def handle_message(message):
         activate_premium(message)
         return
 
-    # Видеокружки и обычные видео обрабатываются отдельно: кадры + длинная речь + голосовой разбор.
-    if message.get("video_note") or message.get("video"):
+    # Видеокружки обрабатываются отдельно: кадры + распознавание речи + перевод.
+    if message.get("video_note"):
         handle_video_note(message)
         return
 
@@ -2329,25 +2172,6 @@ def handle_message(message):
     if not is_voice:
         send_message(chat_id, "⚡ Думаю...")
 
-    # Автоматически ищем только тогда, когда вопрос требует свежих данных.
-    web_query = decide_web_search(text)
-    if web_query:
-        send_message(chat_id, "🌐 Проверяю актуальную информацию в интернете...")
-        web_context = search_web(web_query)
-        if web_context:
-            text_for_ai = (
-                "Ответь на вопрос пользователя, используя найденные ниже материалы. "
-                "Сопоставь источники, не выдавай неподтверждённое за факт, "
-                "укажи даты, если они есть. В конце добавь раздел Источники "
-                "со ссылками на использованные страницы. Если источники не дают ответа, "
-                "честно скажи об этом.\n\nВОПРОС: " + text +
-                "\n\nМАТЕРИАЛЫ ПОИСКА:\n" + web_context
-            )
-        else:
-            text_for_ai = text + "\n\nПоиск в интернете не вернул доступных результатов. Не выдумывай свежие факты и предупреди об этом."
-    else:
-        text_for_ai = text
-
     if is_voice:
         voice_prompt = (
             "Ответь кратко и естественно, максимум 2–4 предложения. "
@@ -2356,11 +2180,11 @@ def handle_message(message):
             "Обращайся к пользователю 'сэр' уместно, но не в каждом предложении. "
             "Не изображай конкретного кино-персонажа и не копируй чужой голос. "
             "Не используй списки, Markdown и эмодзи. Отвечай так, чтобы "
-            "это звучало естественно голосом. Вопрос пользователя: " + text_for_ai
+            "это звучало естественно голосом. Вопрос пользователя: " + text
         )
         answer = ask_ai(chat_id, voice_prompt, max_tokens=VOICE_MAX_TOKENS)
     else:
-        answer = ask_ai(chat_id, text_for_ai, max_tokens=TEXT_MAX_TOKENS)
+        answer = ask_ai(chat_id, text, max_tokens=TEXT_MAX_TOKENS)
 
     count_request(chat_id)
 
@@ -2410,7 +2234,6 @@ def main():
     except Exception as error:
         print("Webhook check error:", error)
 
-    print("Firecrawl search:", "configured" if FIRECRAWL_KEY else "NOT CONFIGURED")
     print("VORTEX запущен и ожидает сообщения.")
 
     while True:
