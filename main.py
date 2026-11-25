@@ -3,7 +3,6 @@ import os
 import json
 import time
 import uuid
-import mimetypes
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode
@@ -46,24 +45,41 @@ style_keyboard = {
 }
 
 
+# =========================
+# TELEGRAM
+# =========================
+
 def tg_request(method, data=None):
     body = urlencode(data or {}).encode()
-    req = urllib.request.Request(TG_API + method, data=body)
+
+    req = urllib.request.Request(
+        TG_API + method,
+        data=body,
+        headers={"User-Agent": "VORTEX-Bot/1.0"}
+    )
 
     with urllib.request.urlopen(req, timeout=45) as response:
         return json.loads(response.read())
 
 
 def send_message(chat_id, text, menu=None):
-    data = {"chat_id": chat_id, "text": text}
+    data = {
+        "chat_id": chat_id,
+        "text": text
+    }
 
     if menu:
         data["reply_markup"] = json.dumps(
-            menu, ensure_ascii=False
+            menu,
+            ensure_ascii=False
         )
 
     tg_request("sendMessage", data)
 
+
+# =========================
+# СОХРАНЕНИЕ ДАННЫХ
+# =========================
 
 def save_history():
     with open("history.json", "w", encoding="utf-8") as file:
@@ -111,6 +127,10 @@ def get_user(chat_id):
 
     return users[key]
 
+
+# =========================
+# ПОДПИСКА И ДОСТУП
+# =========================
 
 def is_subscribed(chat_id):
     try:
@@ -222,6 +242,10 @@ def count_request(chat_id):
         save_users()
 
 
+# =========================
+# GROQ ИИ
+# =========================
+
 def ask_ai(chat_id, prompt):
     history = chat_histories.get(chat_id, [])
 
@@ -240,7 +264,10 @@ def ask_ai(chat_id, prompt):
     ]
 
     messages.extend(history[-8:])
-    messages.append({"role": "user", "content": prompt})
+    messages.append({
+        "role": "user",
+        "content": prompt
+    })
 
     payload = {
         "model": MODEL,
@@ -265,8 +292,15 @@ def ask_ai(chat_id, prompt):
 
         answer = result["choices"][0]["message"]["content"]
 
-        history.append({"role": "user", "content": prompt})
-        history.append({"role": "assistant", "content": answer})
+        history.append({
+            "role": "user",
+            "content": prompt
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": answer
+        })
 
         chat_histories[chat_id] = history[-10:]
         save_history()
@@ -287,7 +321,9 @@ def ask_ai(chat_id, prompt):
         return "Что-то пошло не так. Попробуй ещё раз."
 
 
-# 🎙️ РАСПОЗНАВАНИЕ ГОЛОСОВЫХ
+# =========================
+# РАСПОЗНАВАНИЕ ГОЛОСОВЫХ
+# =========================
 
 def transcribe_voice(file_id):
     try:
@@ -316,18 +352,33 @@ def transcribe_voice(file_id):
             print("Audio file is too large")
             return None
 
+        # Telegram voice обычно использует OGG/Opus.
+        # Проверяем сигнатуру контейнера OGG.
+        print(
+            "Voice file:",
+            file_path,
+            "Size:",
+            len(audio_data),
+            "Signature:",
+            audio_data[:4]
+        )
+
+        if audio_data[:4] != b"OggS":
+            print("Audio is not an OGG file")
+            return None
+
         boundary = "----VORTEX" + uuid.uuid4().hex
 
-        filename = os.path.basename(file_path) or "voice.ogg"
-        content_type = mimetypes.guess_type(filename)[0] or "audio/ogg"
+        # Принудительно указываем поддерживаемый формат.
+        filename = "voice.ogg"
 
         body = (
             f"--{boundary}\r\n"
             'Content-Disposition: form-data; name="model"\r\n\r\n'
             f"{WHISPER_MODEL}\r\n"
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-            f"Content-Type: {content_type}\r\n\r\n"
+            'Content-Disposition: form-data; name="file"; filename="voice.ogg"\r\n'
+            "Content-Type: audio/ogg\r\n\r\n"
         ).encode() + audio_data + (
             f"\r\n--{boundary}--\r\n"
         ).encode()
@@ -349,8 +400,9 @@ def transcribe_voice(file_id):
 
         if not recognized:
             print("Whisper returned empty transcription")
+            return None
 
-        return recognized if recognized else None
+        return recognized
 
     except urllib.error.HTTPError as error:
         details = error.read().decode(errors="ignore")
@@ -361,6 +413,10 @@ def transcribe_voice(file_id):
         print("Voice recognition error:", error)
         return None
 
+
+# =========================
+# CALLBACK-КНОПКИ
+# =========================
 
 def handle_callback(callback):
     chat_id = callback["message"]["chat"]["id"]
@@ -406,12 +462,16 @@ def handle_callback(callback):
         )
 
 
+# =========================
+# ОБРАБОТКА СООБЩЕНИЙ
+# =========================
+
 def handle_message(message):
     chat_id = message["chat"]["id"]
     text = message.get("text", "").strip()
     is_voice = bool(message.get("voice"))
 
-    # 🎙️ Обработка голосовых сообщений
+    # Голосовые сообщения
     if is_voice:
         if not can_use_ai(chat_id):
             return
@@ -441,9 +501,9 @@ def handle_message(message):
     if not text:
         return
 
+    # Старт
     if text == "/start":
         user_states.pop(chat_id, None)
-
         get_user(chat_id)
 
         send_message(
@@ -456,11 +516,13 @@ def handle_message(message):
         )
         return
 
+    # Отмена
     if text in ["/cancel", "❌ Отмена"]:
         user_states.pop(chat_id, None)
         send_message(chat_id, "Действие отменено.", keyboard)
         return
 
+    # Возможности
     if text == "✨ Возможности":
         send_message(
             chat_id,
@@ -475,8 +537,11 @@ def handle_message(message):
         )
         return
 
+    # Создание поста
     if text == "✍️ Создать пост":
-        user_states[chat_id] = {"step": "topic"}
+        user_states[chat_id] = {
+            "step": "topic"
+        }
 
         send_message(
             chat_id,
@@ -489,8 +554,11 @@ def handle_message(message):
         )
         return
 
+    # Идеи
     if text == "💡 Идеи для контента":
-        user_states[chat_id] = {"step": "ideas"}
+        user_states[chat_id] = {
+            "step": "ideas"
+        }
 
         send_message(
             chat_id,
@@ -503,12 +571,16 @@ def handle_message(message):
         )
         return
 
+    # Профиль
     if text == "👤 Мой профиль":
         user = get_user(chat_id)
         access = check_access(chat_id)
 
         if access == "free":
-            status = f"Бесплатные запросы: {user['requests']}/{FREE_REQUESTS}"
+            status = (
+                f"Бесплатные запросы: "
+                f"{user['requests']}/{FREE_REQUESTS}"
+            )
         elif access == "trial":
             status = "Статус: 7 дней бесплатного доступа"
         elif access == "paid":
@@ -527,6 +599,7 @@ def handle_message(message):
 
     state = user_states.get(chat_id, {})
 
+    # Тема поста
     if state.get("step") == "topic":
         user_states[chat_id] = {
             "step": "style",
@@ -540,6 +613,7 @@ def handle_message(message):
         )
         return
 
+    # Стиль поста
     if state.get("step") == "style":
         styles = {
             "💼 Деловой": "деловой и экспертный",
@@ -560,6 +634,7 @@ def handle_message(message):
 
         topic = state["topic"]
         style = styles[text]
+
         user_states.pop(chat_id, None)
 
         send_message(chat_id, "⚡ VORTEX создаёт твой пост...")
@@ -575,6 +650,7 @@ def handle_message(message):
         send_message(chat_id, answer, keyboard)
         return
 
+    # Генерация идей
     if state.get("step") == "ideas":
         if not can_use_ai(chat_id):
             return
@@ -593,6 +669,7 @@ def handle_message(message):
         send_message(chat_id, answer, keyboard)
         return
 
+    # Обычный чат с ИИ
     if not can_use_ai(chat_id):
         return
 
@@ -604,27 +681,68 @@ def handle_message(message):
     send_message(chat_id, answer, keyboard)
 
 
-offset = 0
+# =========================
+# ЗАПУСК БОТА
+# =========================
 
-load_history()
-load_users()
+def main():
+    offset = 0
 
-while True:
+    load_history()
+    load_users()
+
+    print("VORTEX запускается...")
+
+    # Бот использует long polling.
+    # Удаляем webhook, чтобы он не конфликтовал с getUpdates.
     try:
-        updates = tg_request("getUpdates", {
-            "offset": offset,
-            "timeout": 30
+        tg_request("deleteWebhook", {
+            "drop_pending_updates": "false"
         })
-
-        for update in updates.get("result", []):
-            offset = update["update_id"] + 1
-
-            if "callback_query" in update:
-                handle_callback(update["callback_query"])
-
-            elif "message" in update:
-                handle_message(update["message"])
-
+        print("Webhook проверен.")
     except Exception as error:
-        print("Ошибка:", error)
-        time.sleep(3)
+        print("Webhook check error:", error)
+
+    print("VORTEX запущен и ожидает сообщения.")
+
+    while True:
+        try:
+            updates = tg_request("getUpdates", {
+                "offset": offset,
+                "timeout": 30
+            })
+
+            for update in updates.get("result", []):
+                offset = update["update_id"] + 1
+
+                try:
+                    if "callback_query" in update:
+                        handle_callback(update["callback_query"])
+
+                    elif "message" in update:
+                        handle_message(update["message"])
+
+                except Exception as error:
+                    print("Update processing error:", error)
+
+        except urllib.error.HTTPError as error:
+            details = error.read().decode(errors="ignore")
+
+            if error.code == 409:
+                print(
+                    "409 CONFLICT: другой процесс использует "
+                    "этот BOT_TOKEN. Оставь только один экземпляр "
+                    "VORTEX на Railway."
+                )
+                time.sleep(10)
+            else:
+                print("Telegram HTTP error:", error.code, details)
+                time.sleep(5)
+
+        except Exception as error:
+            print("Ошибка:", error)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
