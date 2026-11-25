@@ -26,6 +26,8 @@ TG_API = f"https://api.telegram.org/bot{TOKEN}/"
 TG_FILE_API = f"https://api.telegram.org/file/bot{TOKEN}/"
 GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
+FIRECRAWL_API = "https://api.firecrawl.dev/v2/search"
+FIRECRAWL_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
 
 CF_IMAGE_API = (
     f"https://api.cloudflare.com/client/v4/accounts/"
@@ -847,6 +849,90 @@ def clean_ai_text(value):
     value = re.sub(r" *\n *", "\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
+
+
+# =========================
+# АВТОМАТИЧЕСКИЙ ПОИСК В ИНТЕРНЕТЕ
+# =========================
+
+def decide_web_search(question):
+    """Определяет, нужны ли свежие данные из интернета, и формирует поисковый запрос."""
+    if not FIRECRAWL_KEY:
+        return None
+
+    classifier_prompt = (
+        "Определи, нужен ли для ответа свежий поиск в интернете. "
+        "Ищи, если вопрос о текущих/сегодняшних событиях, новостях, ценах, "
+        "наличии, курсах, погоде, расписаниях, новых версиях/моделях, "
+        "изменяющихся правилах или просит проверить актуальную информацию. "
+        "Не ищи для обычных знаний, советов, творчества, математики и беседы. "
+        "Верни строго JSON без Markdown: {\"search\":true/false,\"query\":\"короткий поисковый запрос\"}. "
+        "Если search=false, query оставь пустым. Вопрос: " + question[:1500]
+    )
+    payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": classifier_prompt}],
+        "temperature": 0,
+        "max_completion_tokens": 100
+    }
+    req = urllib.request.Request(
+        GROQ_API, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_KEY}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            result = json.loads(response.read())
+        raw = result["choices"][0]["message"]["content"].strip()
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if not match:
+            return None
+        decision = json.loads(match.group(0))
+        if decision.get("search") and str(decision.get("query", "")).strip():
+            return str(decision["query"]).strip()[:300]
+    except Exception as error:
+        print("[WEB SEARCH] Intent detection error:", error)
+    return None
+
+
+def search_web(query):
+    """Ищет до пяти страниц через Firecrawl и возвращает выдержки с адресами источников."""
+    if not FIRECRAWL_KEY:
+        return ""
+    payload = {"query": query, "limit": 5, "sources": ["web", "news"], "country": "RU"}
+    req = urllib.request.Request(
+        FIRECRAWL_API, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {FIRECRAWL_KEY}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as response:
+            result = json.loads(response.read())
+        data = result.get("data", {})
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = (data.get("web") or []) + (data.get("news") or [])
+        else:
+            items = []
+        lines = []
+        seen = set()
+        for item in items:
+            url = item.get("url", "")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            title = item.get("title") or "Источник"
+            description = item.get("description") or item.get("markdown") or item.get("content") or ""
+            lines.append(f"{title}\n{str(description)[:900]}\nИсточник: {url}")
+            if len(lines) >= 5:
+                break
+        print(f"[WEB SEARCH] query={query!r}, results={len(lines)}")
+        return "\n\n".join(lines)
+    except urllib.error.HTTPError as error:
+        details = error.read().decode(errors="ignore")
+        print("[WEB SEARCH] Firecrawl HTTP error:", error.code, details[:1500])
+    except Exception as error:
+        print("[WEB SEARCH] Firecrawl error:", error)
+    return ""
 
 
 # =========================
@@ -2188,6 +2274,25 @@ def handle_message(message):
     if not is_voice:
         send_message(chat_id, "⚡ Думаю...")
 
+    # Автоматически ищем только тогда, когда вопрос требует свежих данных.
+    web_query = decide_web_search(text)
+    if web_query:
+        send_message(chat_id, "🌐 Проверяю актуальную информацию в интернете...")
+        web_context = search_web(web_query)
+        if web_context:
+            text_for_ai = (
+                "Ответь на вопрос пользователя, используя найденные ниже материалы. "
+                "Сопоставь источники, не выдавай неподтверждённое за факт, "
+                "укажи даты, если они есть. В конце добавь раздел Источники "
+                "со ссылками на использованные страницы. Если источники не дают ответа, "
+                "честно скажи об этом.\n\nВОПРОС: " + text +
+                "\n\nМАТЕРИАЛЫ ПОИСКА:\n" + web_context
+            )
+        else:
+            text_for_ai = text + "\n\nПоиск в интернете не вернул доступных результатов. Не выдумывай свежие факты и предупреди об этом."
+    else:
+        text_for_ai = text
+
     if is_voice:
         voice_prompt = (
             "Ответь кратко и естественно, максимум 2–4 предложения. "
@@ -2196,11 +2301,11 @@ def handle_message(message):
             "Обращайся к пользователю 'сэр' уместно, но не в каждом предложении. "
             "Не изображай конкретного кино-персонажа и не копируй чужой голос. "
             "Не используй списки, Markdown и эмодзи. Отвечай так, чтобы "
-            "это звучало естественно голосом. Вопрос пользователя: " + text
+            "это звучало естественно голосом. Вопрос пользователя: " + text_for_ai
         )
         answer = ask_ai(chat_id, voice_prompt, max_tokens=VOICE_MAX_TOKENS)
     else:
-        answer = ask_ai(chat_id, text, max_tokens=TEXT_MAX_TOKENS)
+        answer = ask_ai(chat_id, text_for_ai, max_tokens=TEXT_MAX_TOKENS)
 
     count_request(chat_id)
 
@@ -2250,6 +2355,7 @@ def main():
     except Exception as error:
         print("Webhook check error:", error)
 
+    print("Firecrawl search:", "configured" if FIRECRAWL_KEY else "NOT CONFIGURED")
     print("VORTEX запущен и ожидает сообщения.")
 
     while True:
