@@ -3,6 +3,7 @@ import os
 import json
 import time
 import uuid
+import base64
 import urllib.request
 import urllib.error
 from urllib.parse import urlencode
@@ -11,9 +12,17 @@ from datetime import datetime, timedelta, timezone
 TOKEN = os.environ["BOT_TOKEN"]
 GROQ_KEY = os.environ["GROQ_API_KEY"]
 
+CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+
 TG_API = f"https://api.telegram.org/bot{TOKEN}/"
 GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+CF_IMAGE_API = (
+    f"https://api.cloudflare.com/client/v4/accounts/"
+    f"{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+)
 
 MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
@@ -30,7 +39,8 @@ users = {}
 keyboard = {
     "keyboard": [
         [{"text": "✨ Возможности"}, {"text": "✍️ Создать пост"}],
-        [{"text": "💡 Идеи для контента"}, {"text": "👤 Мой профиль"}]
+        [{"text": "💡 Идеи для контента"}, {"text": "🎨 Создать картинку"}],
+        [{"text": "👤 Мой профиль"}]
     ],
     "resize_keyboard": True
 }
@@ -75,6 +85,41 @@ def send_message(chat_id, text, menu=None):
         )
 
     tg_request("sendMessage", data)
+
+
+def send_photo(chat_id, image_data, caption=""):
+    boundary = "----VORTEX" + uuid.uuid4().hex
+
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        f"{chat_id}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="caption"\r\n\r\n'
+        f"{caption}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="photo"; filename="vortex.jpg"\r\n'
+        "Content-Type: image/jpeg\r\n\r\n"
+    ).encode() + image_data + (
+        f"\r\n--{boundary}--\r\n"
+    ).encode()
+
+    req = urllib.request.Request(
+        TG_API + "sendPhoto",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
+    )
+
+    with urllib.request.urlopen(req, timeout=120) as response:
+        result = json.loads(response.read())
+
+    if not result.get("ok"):
+        raise Exception(str(result))
+
+    return result
 
 
 # =========================
@@ -327,6 +372,66 @@ def ask_ai(chat_id, prompt):
 
 
 # =========================
+# ГЕНЕРАЦИЯ КАРТИНОК CLOUDFLARE
+# =========================
+
+def generate_image(prompt):
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        print("Cloudflare credentials are missing")
+        return None
+
+    if len(prompt) > 2048:
+        prompt = prompt[:2048]
+
+    payload = {
+        "prompt": prompt,
+        "steps": 4
+    }
+
+    req = urllib.request.Request(
+        CF_IMAGE_API,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {CF_API_TOKEN}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=180) as response:
+            result = json.loads(response.read())
+
+        if not result.get("success", False):
+            print("Cloudflare API error:", result)
+            return None
+
+        image_base64 = result.get("result", {}).get("image")
+
+        if not image_base64:
+            print("Cloudflare returned no image")
+            print(result)
+            return None
+
+        image_data = base64.b64decode(image_base64)
+
+        if not image_data:
+            print("Generated image is empty")
+            return None
+
+        return image_data
+
+    except urllib.error.HTTPError as error:
+        details = error.read().decode(errors="ignore")
+        print("Cloudflare HTTP error:", error.code, details)
+        return None
+
+    except Exception as error:
+        print("Cloudflare image error:", error)
+        return None
+
+
+# =========================
 # РАСПОЗНАВАНИЕ ГОЛОСОВЫХ
 # =========================
 
@@ -512,6 +617,7 @@ def handle_message(message):
             "идеи в готовые результаты.\n\n"
             "✍️ Создаю посты для соцсетей\n"
             "💡 Генерирую идеи для контента\n"
+            "🎨 Создаю изображения по описанию\n"
             "🧠 Отвечаю на вопросы\n"
             "🎙️ Распознаю голосовые сообщения\n"
             "🔥 Улучшаю и редактирую тексты\n\n"
@@ -537,7 +643,8 @@ def handle_message(message):
             "• Помощь с текстами\n"
             "• Ответы на вопросы\n"
             "• Разные стили написания\n"
-            "• 🎙️ Распознавание голосовых",
+            "• 🎙️ Распознавание голосовых\n"
+            "• 🎨 Генерация изображений",
             keyboard
         )
         return
@@ -552,6 +659,27 @@ def handle_message(message):
             chat_id,
             "✍️ На какую тему создаём пост?\n\n"
             "Напиши тему одним сообщением.",
+            {
+                "keyboard": [[{"text": "❌ Отмена"}]],
+                "resize_keyboard": True
+            }
+        )
+        return
+
+    # ГЕНЕРАЦИЯ КАРТИНОК
+    if text == "🎨 Создать картинку":
+        user_states[chat_id] = {
+            "step": "image_prompt"
+        }
+
+        send_message(
+            chat_id,
+            "🎨 VORTEX готов создать изображение!\n\n"
+            "Опиши, что хочешь увидеть.\n\n"
+            "Например:\n"
+            "«Футуристический город ночью, "
+            "неоновые вывески, дождь, кинематографичный стиль»\n\n"
+            "Чем подробнее описание, тем лучше результат.",
             {
                 "keyboard": [[{"text": "❌ Отмена"}]],
                 "resize_keyboard": True
@@ -603,6 +731,70 @@ def handle_message(message):
         return
 
     state = user_states.get(chat_id, {})
+
+    # ОПИСАНИЕ КАРТИНКИ
+    if state.get("step") == "image_prompt":
+        if not can_use_ai(chat_id):
+            return
+
+        if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+            send_message(
+                chat_id,
+                "❌ Генерация пока не настроена.\n"
+                "Проверь переменные Cloudflare в Railway.",
+                keyboard
+            )
+            return
+
+        if len(text) > 2048:
+            send_message(
+                chat_id,
+                "❌ Описание слишком длинное.\n"
+                "Максимум 2048 символов. Сократи описание.",
+                keyboard
+            )
+            return
+
+        user_states.pop(chat_id, None)
+
+        send_message(
+            chat_id,
+            "🎨 VORTEX создаёт изображение...\n\n"
+            "Это может занять некоторое время."
+        )
+
+        image_data = generate_image(text)
+
+        if not image_data:
+            send_message(
+                chat_id,
+                "❌ Не удалось создать изображение.\n\n"
+                "Возможно, временно недоступен Cloudflare "
+                "или закончилась дневная квота.\n"
+                "Попробуй немного позже.",
+                keyboard
+            )
+            return
+
+        try:
+            send_photo(
+                chat_id,
+                image_data,
+                "⚡ Создано с помощью VORTEX"
+            )
+
+            count_request(chat_id)
+
+        except Exception as error:
+            print("Telegram sendPhoto error:", error)
+            send_message(
+                chat_id,
+                "Изображение создано, но Telegram не смог "
+                "его отправить. Попробуй ещё раз.",
+                keyboard
+            )
+
+        return
 
     # ТЕМА ПОСТА
     if state.get("step") == "topic":
@@ -697,6 +889,11 @@ def main():
     load_users()
 
     print("VORTEX запускается...")
+
+    if CF_ACCOUNT_ID and CF_API_TOKEN:
+        print("Cloudflare Image API настроен.")
+    else:
+        print("ВНИМАНИЕ: Cloudflare Image API не настроен.")
 
     try:
         tg_request("deleteWebhook", {
