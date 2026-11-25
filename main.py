@@ -52,7 +52,6 @@ TRIAL_DAYS = 7
 STARS_PRICE = 65
 PREMIUM_DAYS = 30
 
-# Короткие ответы для ускорения Piper
 VOICE_MAX_TOKENS = 180
 TEXT_MAX_TOKENS = 1200
 VOICE_SPEED = "atempo=1.10"
@@ -60,6 +59,16 @@ VOICE_SPEED = "atempo=1.10"
 user_states = {}
 chat_histories = {}
 users = {}
+
+# =========================
+# RAILWAY PERSISTENT STORAGE
+# =========================
+
+DATA_DIR = "/app/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 
 keyboard = {
     "keyboard": [
@@ -369,37 +378,94 @@ def text_to_speech(text):
 # СОХРАНЕНИЕ ДАННЫХ
 # =========================
 
+def save_json(path, data):
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=DATA_DIR,
+            delete=False
+        ) as file:
+            json.dump(data, file, ensure_ascii=False)
+            file.flush()
+            os.fsync(file.fileno())
+            temp_path = file.name
+
+        os.replace(temp_path, path)
+
+    except Exception:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+
+def load_json(path, default):
+    legacy_path = os.path.join(
+        os.getcwd(),
+        os.path.basename(path)
+    )
+
+    if not os.path.exists(path):
+        if os.path.exists(legacy_path):
+            print("Migrating old data:", legacy_path)
+
+            with open(legacy_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            save_json(path, data)
+            print("Data migrated:", path)
+            return data
+
+        print("No existing data file:", path)
+        return default
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    except json.JSONDecodeError as error:
+        backup_path = path + ".corrupt." + str(int(time.time()))
+        os.replace(path, backup_path)
+
+        print("CORRUPTED DATA BACKED UP:", backup_path)
+
+        if os.path.exists(legacy_path):
+            with open(legacy_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            save_json(path, data)
+            return data
+
+        raise RuntimeError(
+            "Data file is corrupted. Backup: " + backup_path
+        ) from error
+
+
 def save_history():
-    with open("history.json", "w", encoding="utf-8") as file:
-        json.dump(chat_histories, file, ensure_ascii=False)
+    save_json(HISTORY_FILE, chat_histories)
 
 
 def load_history():
     global chat_histories
 
-    try:
-        with open("history.json", "r", encoding="utf-8") as file:
-            chat_histories = {
-                int(key): value
-                for key, value in json.load(file).items()
-            }
-    except (FileNotFoundError, json.JSONDecodeError):
-        chat_histories = {}
+    data = load_json(HISTORY_FILE, {})
+
+    chat_histories = {
+        int(key): value
+        for key, value in data.items()
+    }
 
 
 def save_users():
-    with open("users.json", "w", encoding="utf-8") as file:
-        json.dump(users, file, ensure_ascii=False)
+    save_json(USERS_FILE, users)
 
 
 def load_users():
     global users
 
-    try:
-        with open("users.json", "r", encoding="utf-8") as file:
-            users = json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        users = {}
+    users = load_json(USERS_FILE, {})
 
 
 def get_user(chat_id):
@@ -1783,6 +1849,9 @@ def main():
     load_users()
 
     print("VORTEX запускается...")
+    print("Persistent storage directory:", DATA_DIR)
+    print("Users file:", USERS_FILE, "exists:", os.path.exists(USERS_FILE))
+    print("History file:", HISTORY_FILE, "exists:", os.path.exists(HISTORY_FILE))
 
     if CF_ACCOUNT_ID and CF_API_TOKEN:
         print("Cloudflare Image API настроен.")
