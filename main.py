@@ -68,7 +68,9 @@ def load_history():
                 for key, value in json.load(file).items()
             }
     except (FileNotFoundError, json.JSONDecodeError):
-        chat_histories = {}
+            chat_histories = {}
+
+
 def ask_ai(chat_id, prompt):
     history = chat_histories.get(chat_id, [])
 
@@ -118,7 +120,7 @@ def ask_ai(chat_id, prompt):
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": answer})
         chat_histories[chat_id] = history[-10:]
-save_history()
+        save_history()
         return answer.strip()
 
     except urllib.error.HTTPError as error:
@@ -142,7 +144,7 @@ def handle_message(message):
 
     if text == "/start":
         user_states.pop(chat_id, None)
-        chat_histories.pop(chat_id, None)
+        
         send_message(
             chat_id,
             "⚡ VORTEX\n\nТвой ИИ-помощник.\n\n"
