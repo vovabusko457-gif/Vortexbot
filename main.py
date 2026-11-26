@@ -39,7 +39,7 @@ CF_EDIT_API = (
 
 MODEL = "openai/gpt-oss-20b"
 WHISPER_MODEL = "whisper-large-v3-turbo"
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+VISION_MODEL = "qwen/qwen3.8-27b"
 
 PIPER_VOICE = "ru_RU-ruslan-medium"
 PIPER_DIR = os.path.join(os.getcwd(), "piper_voices")
