@@ -6,6 +6,7 @@ import uuid
 import base64
 import io
 import re
+import random
 import unicodedata
 import subprocess
 import tempfile
@@ -666,11 +667,24 @@ def get_memory_summary(chat_id):
     return str(entry.get("summary", "")).strip()
 
 
-def update_long_term_memory(chat_id, user_text, assistant_text):
-    """Раз в несколько обычных диалогов обновляет компактную долговременную память."""
+def update_long_term_memory(chat_id, user_text, assistant_text, event_type="dialogue"):
+    """Накапливает важные события из диалогов и специальных функций."""
     key = str(chat_id)
-    entry = long_term_memories.setdefault(key, {"summary": "", "pending_turns": 0})
+    entry = long_term_memories.setdefault(
+        key, {"summary": "", "pending_turns": 0, "events": []}
+    )
+    entry.setdefault("events", [])
     entry["pending_turns"] = int(entry.get("pending_turns", 0)) + 1
+
+    # Храним небольшой буфер событий, чтобы не терять проекты между
+    # специальными сценариями, которые не попадают в обычную историю чата.
+    event = {
+        "type": str(event_type)[:40],
+        "user": str(user_text or "")[:700],
+        "result": str(assistant_text or "")[:500],
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    }
+    entry["events"] = (entry["events"] + [event])[-12:]
 
     # Не вызываем дополнительную модель после каждого сообщения.
     if entry["pending_turns"] < 4:
@@ -679,28 +693,31 @@ def update_long_term_memory(chat_id, user_text, assistant_text):
 
     recent = chat_histories.get(chat_id, [])[-8:]
     old_summary = str(entry.get("summary", "")).strip()
+    recent_events = entry.get("events", [])[-12:]
     prompt = (
         "Обнови краткую долговременную память о пользователе для будущих разговоров. "
-        "Сохраняй только полезные устойчивые факты, предпочтения, текущие проекты, цели и важный контекст. "
-        "Не сохраняй случайные мелочи, одноразовые вопросы, пароли, ключи, финансовые реквизиты или другие секреты. "
-        "Отдельно сохраняй незавершённые темы и проекты, к которым стоит вернуться, устойчивые внутренние шутки "
-        "и повторяющиеся забавные моменты, если они действительно важны для общения. Помечай, что именно осталось "
-        "незавершённым, но не превращай память в список случайных реплик. "
-        "Не делай выводов, которых пользователь прямо не сообщал. Если факт устарел или пользователь его исправил, "
-        "используй более новую информацию. Пиши по-русски, кратко, максимум 1200 символов. "
-        "Верни только обновлённую память обычным текстом, без вступления. Если сохранять нечего, верни пустую строку.\n\n"
+        "Сохраняй полезные устойчивые факты, предпочтения, текущие проекты, цели, принятые решения "
+        "и важный контекст. Учитывай события не только из обычного чата, но и из специальных функций: "
+        "создание и редактирование изображений, презентаций, постов, идей и анализ видео. "
+        "Сохраняй проект или задачу, если по событию видно, что пользователь над ней работает, "
+        "но не превращай память в журнал всех действий. Объединяй повторяющиеся сведения, "
+        "обновляй устаревшие факты по более новым сообщениям и отмечай незавершённые дела. "
+        "Не сохраняй случайные мелочи, одноразовые вопросы, пароли, ключи, токены, коды, "
+        "финансовые реквизиты или другие секреты. Не делай выводов, которых пользователь прямо не сообщал. "
+        "Пиши по-русски, максимум 1600 символов. Верни только обновлённую память обычным текстом. "
+        "Если сохранять нечего, верни пустую строку.\n\n"
         f"Предыдущая память:\n{old_summary or 'Пока пусто.'}\n\n"
-        f"Последние сообщения диалога (JSON):\n{json.dumps(recent, ensure_ascii=False)}\n\n"
-        f"Последний обмен:\nПользователь: {user_text}\nVORTEX: {assistant_text}"
+        f"События с момента прошлого обновления (JSON):\n{json.dumps(recent_events, ensure_ascii=False)}\n\n"
+        f"Последние сообщения обычного диалога (JSON):\n{json.dumps(recent, ensure_ascii=False)}"
     )
     payload = {
         "model": MODEL,
         "messages": [
-            {"role": "system", "content": "Ты аккуратный редактор персональной памяти. Не выдумывай факты."},
+            {"role": "system", "content": "Ты аккуратный редактор персональной памяти. Не выдумывай факты и не сохраняй секреты."},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.1,
-        "max_completion_tokens": 500
+        "max_completion_tokens": 600
     }
     req = urllib.request.Request(
         GROQ_API,
@@ -714,13 +731,14 @@ def update_long_term_memory(chat_id, user_text, assistant_text):
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             result = json.loads(response.read())
-        summary = clean_ai_text(result["choices"][0]["message"]["content"])[:1200]
+        summary = clean_ai_text(result["choices"][0]["message"]["content"])[:1600]
         entry["summary"] = summary
         entry["pending_turns"] = 0
+        entry["events"] = []
         save_memories()
         print(f"[MEMORY] Updated for chat {chat_id}; chars={len(summary)}")
     except Exception as error:
-        # Оставляем pending_turns, чтобы повторить обновление при следующем диалоге.
+        # События и счётчик остаются на месте, чтобы повторить обновление позже.
         print("[MEMORY] Update failed:", repr(error))
         save_memories()
 
@@ -1616,6 +1634,7 @@ def handle_photo_edit(message):
             "⚡ Фото отредактировано с помощью VORTEX"
         )
 
+        update_long_term_memory(chat_id, caption, "VORTEX успешно отредактировал фотографию по инструкции пользователя.", "photo_edit")
         count_request(chat_id)
 
     except Exception as error:
@@ -1911,6 +1930,157 @@ def transcribe_voice(file_id):
 
 
 # =========================
+# ИГРА: МОРСКОЙ БОЙ
+# =========================
+BATTLESHIPS_FILE = os.path.join(DATA_DIR, "battleships.json")
+battleship_games = {}
+
+
+def save_battleship_games():
+    save_json(BATTLESHIPS_FILE, battleship_games)
+
+
+def load_battleship_games():
+    global battleship_games
+    battleship_games = load_json(BATTLESHIPS_FILE, {})
+
+
+def new_battleship_board():
+    board = [[0 for _ in range(10)] for _ in range(10)]
+    for length in (4, 3, 2, 1):
+        placed = False
+        for _ in range(500):
+            horizontal = random.choice((True, False))
+            row, col = random.randrange(10), random.randrange(10)
+            cells = [(row, col + i) for i in range(length)] if horizontal else [(row + i, col) for i in range(length)]
+            if any(r >= 10 or c >= 10 for r, c in cells):
+                continue
+            if any(board[r][c] or any(board[rr][cc] for rr in range(max(0, r-1), min(10, r+2)) for cc in range(max(0, c-1), min(10, c+2))) for r, c in cells):
+                continue
+            for r, c in cells:
+                board[r][c] = 1
+            placed = True
+            break
+        if not placed:
+            return new_battleship_board()
+    return board
+
+
+def start_battleship(chat_id):
+    battleship_games[str(chat_id)] = {
+        "player": new_battleship_board(),
+        "enemy": new_battleship_board(),
+        "shots": [["?" for _ in range(10)] for _ in range(10)],
+        "bot_shots": [["?" for _ in range(10)] for _ in range(10)],
+        "player_hits": 0,
+        "bot_hits": 0,
+        "bot_log": []
+    }
+    save_battleship_games()
+    send_battleship_board(chat_id)
+
+
+def battleship_markup(game):
+    rows = []
+    for r in range(10):
+        row = []
+        for c in range(10):
+            mark = game["shots"][r][c]
+            symbol = "⬜" if mark == "?" else ("💥" if mark == "H" else "🌊")
+            row.append({"text": symbol, "callback_data": f"bs:{r}:{c}"})
+        rows.append(row)
+    rows.append([{"text": "🔄 Новая игра", "callback_data": "bs:new"}, {"text": "✖️ Выйти", "callback_data": "bs:exit"}])
+    return {"inline_keyboard": rows}
+
+
+def battleship_text(game):
+    log = game.get("bot_log", [])[-4:]
+    bot_status = ", ".join(log) if log else "пока не стрелял"
+    return (
+        "⚓ МОРСКОЙ БОЙ\n\n"
+        "Тапай по клеткам и ищи мои корабли.\n"
+        f"Твои попадания: {game['player_hits']}/10 | Мои: {game['bot_hits']}/10\n"
+        f"Мои выстрелы: {bot_status}\n\n"
+        "⬜ неизвестно   💥 попадание   🌊 мимо"
+    )
+
+
+def send_battleship_board(chat_id, message_id=None):
+    game = battleship_games.get(str(chat_id))
+    if not game:
+        return
+    data = {
+        "chat_id": chat_id,
+        "text": battleship_text(game),
+        "reply_markup": json.dumps(battleship_markup(game), ensure_ascii=False)
+    }
+    if message_id:
+        data["message_id"] = message_id
+        try:
+            tg_request("editMessageText", data)
+            return
+        except Exception as error:
+            print("Battleship edit error:", error)
+    result = tg_request("sendMessage", data)
+    if isinstance(result, dict) and result.get("ok"):
+        game["message_id"] = result.get("result", {}).get("message_id")
+        save_battleship_games()
+
+
+def battleship_bot_shot(game):
+    available = [(r, c) for r in range(10) for c in range(10) if game["bot_shots"][r][c] == "?"]
+    if not available:
+        return
+    r, c = random.choice(available)
+    hit = game["player"][r][c] == 1
+    game["bot_shots"][r][c] = "H" if hit else "M"
+    if hit:
+        game["player"][r][c] = 2
+        game["bot_hits"] += 1
+    game.setdefault("bot_log", []).append(f"{chr(65+c)}{r+1} {'попал' if hit else 'мимо'}")
+
+
+def handle_battleship_callback(callback, data):
+    chat_id = callback["message"]["chat"]["id"]
+    message_id = callback["message"].get("message_id")
+    key = str(chat_id)
+    if data == "bs:new":
+        start_battleship(chat_id)
+        return
+    if data == "bs:exit":
+        battleship_games.pop(key, None)
+        save_battleship_games()
+        tg_request("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": "⚓ Игра окончена. Если захочешь реванш, напиши /battleship."})
+        return
+    game = battleship_games.get(key)
+    if not game:
+        send_message(chat_id, "Эта партия уже закончилась. Напиши /battleship, чтобы начать новую.")
+        return
+    try:
+        _, row_s, col_s = data.split(":")
+        r, c = int(row_s), int(col_s)
+    except (ValueError, TypeError):
+        return
+    if not (0 <= r < 10 and 0 <= c < 10) or game["shots"][r][c] != "?":
+        return
+    hit = game["enemy"][r][c] == 1
+    game["shots"][r][c] = "H" if hit else "M"
+    if hit:
+        game["enemy"][r][c] = 2
+        game["player_hits"] += 1
+    if game["player_hits"] >= 10:
+        save_battleship_games()
+        tg_request("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": "🏆 Ты потопил весь мой флот! Красиво сыграно, сэр. Реванш?", "reply_markup": json.dumps({"inline_keyboard": [[{"text": "🔄 Реванш", "callback_data": "bs:new"}]]}, ensure_ascii=False)})
+        return
+    battleship_bot_shot(game)
+    save_battleship_games()
+    if game["bot_hits"] >= 10:
+        tg_request("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": "💀 Я потопил весь твой флот! Вот это морское сражение. Реванш?", "reply_markup": json.dumps({"inline_keyboard": [[{"text": "🔄 Реванш", "callback_data": "bs:new"}]]}, ensure_ascii=False)})
+        return
+    send_battleship_board(chat_id, message_id)
+
+
+# =========================
 # CALLBACK-КНОПКИ
 # =========================
 
@@ -1922,7 +2092,12 @@ def handle_callback(callback):
         "callback_query_id": callback_id
     })
 
-    if callback.get("data") != "check_subscription":
+    callback_data = callback.get("data", "")
+    if callback_data.startswith("bs:"):
+        handle_battleship_callback(callback, callback_data)
+        return
+
+    if callback_data != "check_subscription":
         return
 
     if not is_subscribed(chat_id):
@@ -1998,6 +2173,7 @@ def handle_last_image_edit(chat_id, instruction):
     try:
         save_last_image(chat_id, edited)
         send_photo(chat_id, edited, "Готово. Это обновлённая версия изображения.")
+        update_long_term_memory(chat_id, instruction, "VORTEX изменил последнее созданное изображение.", "image_edit")
         count_request(chat_id)
     except Exception as error:
         print("Last image edit send error:", error)
@@ -2218,6 +2394,10 @@ def handle_message(message):
         count_request(chat_id)
         return
 
+    if command in ("/battleship", "/морскойбой", "/морской_бой") or text.lower() in ("🎮 морской бой", "морской бой", "сыграем в морской бой"):
+        start_battleship(chat_id)
+        return
+
     if command == "/start":
         user_states.pop(chat_id, None)
         get_user(chat_id)
@@ -2322,6 +2502,7 @@ def handle_message(message):
             return
         try:
             send_document(chat_id, presentation_data, "VORTEX_presentation.pptx", "Готово. Презентация PowerPoint с иллюстрациями.")
+            update_long_term_memory(chat_id, text, "Пользователь запросил и получил презентацию PowerPoint.", "presentation")
             count_request(chat_id)
         except Exception as error:
             print("Presentation send error:", error)
@@ -2351,6 +2532,7 @@ def handle_message(message):
         try:
             save_last_image(chat_id, image_data)
             send_photo(chat_id, image_data, "Создано с помощью VORTEX")
+            update_long_term_memory(chat_id, text, "VORTEX создал изображение по запросу пользователя.", "image_generation")
             count_request(chat_id)
         except Exception as error:
             print("Telegram sendPhoto error:", error)
@@ -2367,6 +2549,7 @@ def handle_message(message):
             "Не задавай вопросы, если данных достаточно. Запрос: " + text
         )
         answer = ask_ai(chat_id, prompt, max_tokens=TEXT_MAX_TOKENS)
+        update_long_term_memory(chat_id, text, "VORTEX подготовил текст поста.", "post_creation")
         count_request(chat_id)
         send_message(chat_id, answer)
         return
@@ -2380,6 +2563,7 @@ def handle_message(message):
             "Оформи обычным текстом, без Markdown, звёздочек, решёток и хештегов. Запрос: " + text,
             max_tokens=TEXT_MAX_TOKENS
         )
+        update_long_term_memory(chat_id, text, "VORTEX подготовил идеи для пользователя.", "idea_generation")
         count_request(chat_id)
         send_message(chat_id, answer)
         return
@@ -2433,6 +2617,7 @@ def main():
     load_history()
     load_users()
     load_memories()
+    load_battleship_games()
 
     print("VORTEX запускается...")
     print("Persistent storage directory:", DATA_DIR)
