@@ -1561,7 +1561,8 @@ def transcribe_audio_bytes(audio_data, filename="circle.mp3", content_type="audi
     req = urllib.request.Request(
         GROQ_AUDIO_API, data=body,
         headers={"Authorization": f"Bearer {GROQ_KEY}",
-                 "Content-Type": f"multipart/form-data; boundary={boundary}"}
+                 "Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "User-Agent": "VORTEX-Bot/1.0"}
     )
     try:
         with urllib.request.urlopen(req, timeout=120) as response:
