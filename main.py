@@ -2447,9 +2447,16 @@ def detect_intent(text):
     """Распознаёт намерение пользователя по обычной русской формулировке."""
     value = text.lower().strip().replace("ё", "е")
 
-    youtube_action = re.search(r"\b(?:найди|найти|поищи|поиск|покажи|включи|дай|дайте)\b", value)
+    youtube_action = re.search(r"\b(?:найди|найти|поищи|поиск|покажи|включи|дай|дайте|скинь|пришли|отправь)\b", value)
     youtube_subject = re.search(r"\b(?:youtube|ютуб|канал\w*|ютубер\w*|блогер\w*|видео|ролик\w*|стрим\w*|трансляц\w*|эфир)\b", value)
-    if youtube_action and youtube_subject:
+    # Голосовое распознавание иногда теряет слово «YouTube», поэтому
+    # фраза «дай ссылку на канал Булкина» тоже считается поиском канала.
+    channel_link_request = (
+        re.search(r"\b(?:ссылк\w*|канал\w*)\b", value)
+        and re.search(r"\b(?:канал\w*|блогер\w*|ютубер\w*)\b", value)
+        and youtube_action
+    )
+    if youtube_action and youtube_subject or channel_link_request:
         return "youtube"
 
     presentation_patterns = (
@@ -2653,6 +2660,8 @@ def handle_message(message):
     intent = detected_intent if (not is_voice or detected_intent == "youtube") else "chat"
 
     if intent == "youtube":
+        # Ссылка всегда отправляется отдельным текстовым сообщением,
+        # даже если запрос пришёл голосовым сообщением.
         handle_youtube_search(chat_id, text)
         count_request(chat_id)
         return
