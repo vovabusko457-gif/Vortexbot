@@ -1013,11 +1013,19 @@ def start_yoomoney_http_server():
                 return self._reply(404, "text/plain; charset=utf-8", "Not found")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > 65536:
+                if length < 0 or length > 65536:
                     return self._reply(400, "text/plain; charset=utf-8", "Bad request")
-                raw = self.rfile.read(length).decode("utf-8")
+                raw = self.rfile.read(length).decode("utf-8") if length else ""
                 parsed = parse_qs(raw, keep_blank_values=True)
                 params = {key: values[-1] for key, values in parsed.items()}
+
+                # YooMoney's dashboard test notification may arrive with an
+                # empty body or test_notification=true. Acknowledge it without
+                # signature validation and, critically, without activating Premium.
+                if not params or str(params.get("test_notification", "")).lower() == "true":
+                    print("[YOOMONEY WEBHOOK] Test notification acknowledged; Premium not changed.")
+                    return self._reply(200, "text/plain; charset=utf-8", "OK")
+
                 activated, duplicate = activate_yoomoney_order(params)
                 if activated:
                     chat_id, paid_until = activated
