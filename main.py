@@ -2443,9 +2443,107 @@ def handle_youtube_search(chat_id, text):
         lines.append("\nПроверь, что эфир официальный и доступен в твоём регионе.")
     send_message(chat_id, "\n".join(lines))
 
+
+def _weather_city_from_text(text):
+    """Извлекает город из запроса о погоде и нормализует частые падежные формы."""
+    value = (text or "").strip()
+    match = re.search(r"(?i)(?:\bв\s+|\bдля\s+|\bпо\s+)([А-Яа-яЁёA-Za-z\- ]{2,50})", value)
+    city = match.group(1).strip(" .,!?:;-") if match else ""
+    city = re.split(r"(?i)\s+(?:сейчас|сегодня|завтра|на\s+неделе|на\s+выходных|погода|температура)", city)[0].strip()
+    normalized = {
+        "краснодаре": "Краснодар", "москве": "Москва", "питере": "Санкт-Петербург",
+        "санкт-петербурге": "Санкт-Петербург", "петербурге": "Санкт-Петербург",
+        "ростове": "Ростов-на-Дону", "сочи": "Сочи", "екатеринбурге": "Екатеринбург",
+        "новосибирске": "Новосибирск", "казани": "Казань", "самаре": "Самара",
+        "воронеже": "Воронеж", "красноярске": "Красноярск", "перми": "Пермь",
+        "нижнем новгороде": "Нижний Новгород", "волгограде": "Волгоград",
+        "калининграде": "Калининград", "минске": "Минск", "рижe": "Рига"
+    }
+    return normalized.get(city.lower(), city)
+
+
+def get_live_weather(city):
+    """Получает текущую погоду из Open-Meteo. API бесплатный, ключ не нужен."""
+    if not city:
+        raise ValueError("Не удалось определить город")
+    geo_url = "https://geocoding-api.open-meteo.com/v1/search?" + urlencode({
+        "name": city, "count": 1, "language": "ru", "format": "json"
+    })
+    req = urllib.request.Request(geo_url, headers={"User-Agent": "VORTEX-Bot/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        geo = json.loads(response.read().decode("utf-8"))
+    places = geo.get("results") or []
+    if not places:
+        raise LookupError("Город не найден")
+    place = places[0]
+    weather_url = "https://api.open-meteo.com/v1/forecast?" + urlencode({
+        "latitude": place["latitude"], "longitude": place["longitude"],
+        "current": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        "forecast_days": 1, "timezone": "auto"
+    })
+    req = urllib.request.Request(weather_url, headers={"User-Agent": "VORTEX-Bot/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    current = data.get("current") or {}
+    daily = data.get("daily") or {}
+    code = current.get("weather_code")
+    descriptions = {
+        0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность", 3: "пасмурно",
+        45: "туман", 48: "изморозевый туман", 51: "небольшая морось", 53: "морось",
+        55: "сильная морось", 56: "ледяная морось", 57: "сильная ледяная морось",
+        61: "небольшой дождь", 63: "дождь", 65: "сильный дождь", 66: "ледяной дождь",
+        67: "сильный ледяной дождь", 71: "небольшой снег", 73: "снег", 75: "сильный снег",
+        77: "снежные зёрна", 80: "небольшие ливни", 81: "ливни", 82: "сильные ливни",
+        85: "снегопад", 86: "сильный снегопад", 95: "гроза", 96: "гроза с градом", 99: "сильная гроза с градом"
+    }
+    name = place.get("name", city)
+    admin = place.get("admin1")
+    location = name + (", " + admin if admin and admin.lower() != name.lower() else "")
+    temp = current.get("temperature_2m")
+    feels = current.get("apparent_temperature")
+    wind = current.get("wind_speed_10m")
+    humidity = current.get("relative_humidity_2m")
+    rain_chance = (daily.get("precipitation_probability_max") or [None])[0]
+    high = (daily.get("temperature_2m_max") or [None])[0]
+    low = (daily.get("temperature_2m_min") or [None])[0]
+    lines = [f"🌤 Погода сейчас, сэр: {location}", f"{descriptions.get(code, 'погодные условия уточняются')}, {temp}°C."]
+    if feels is not None: lines.append(f"Ощущается как: {feels}°C.")
+    if high is not None and low is not None: lines.append(f"Сегодня: от {low}°C до {high}°C.")
+    if rain_chance is not None: lines.append(f"Вероятность осадков сегодня: {rain_chance}%.")
+    if wind is not None: lines.append(f"Ветер: {wind} км/ч.")
+    if humidity is not None: lines.append(f"Влажность: {humidity}%.")
+    lines.append("Данные получены онлайн из Open-Meteo.")
+    return "\n".join(lines)
+
+
+def handle_weather_request(chat_id, text, is_voice=False):
+    city = _weather_city_from_text(text)
+    if not city:
+        send_message(chat_id, "Сэр, назовите город. Например: «Какая сейчас погода в Краснодаре?»")
+        return
+    send_message(chat_id, f"🌐 Проверяю текущую погоду в {city}...")
+    try:
+        answer = get_live_weather(city)
+    except Exception as error:
+        print("[WEATHER] Live lookup failed:", repr(error))
+        answer = (f"Сэр, сейчас не удалось получить свежую погоду для {city}. "
+                  "Похоже, внешний погодный сервис временно недоступен. Попробуйте чуть позже.")
+    send_message(chat_id, answer)
+    if is_voice:
+        audio = text_to_speech(re.sub(r"https?://\S+", "", answer))
+        if audio:
+            try: send_voice(chat_id, audio)
+            except Exception as error: print("[WEATHER] Voice reply failed:", repr(error))
+
+
 def detect_intent(text):
     """Распознаёт намерение пользователя по обычной русской формулировке."""
     value = text.lower().strip().replace("ё", "е")
+
+    weather_words = re.search(r"\b(?:погод\w*|температур\w*|дожд\w*|снег\w*|ветер\w*)\b", value)
+    if weather_words:
+        return "weather"
 
     youtube_action = re.search(r"\b(?:найди|найти|поищи|поиск|покажи|включи|дай|дайте|скинь|пришли|отправь)\b", value)
     youtube_subject = re.search(r"\b(?:youtube|ютуб|канал\w*|ютубер\w*|блогер\w*|видео|ролик\w*|стрим\w*|трансляц\w*|эфир)\b", value)
@@ -2657,7 +2755,12 @@ def handle_message(message):
         return
 
     detected_intent = detect_intent(text)
-    intent = detected_intent if (not is_voice or detected_intent == "youtube") else "chat"
+    intent = detected_intent if (not is_voice or detected_intent in ("youtube", "weather")) else "chat"
+
+    if intent == "weather":
+        handle_weather_request(chat_id, text, is_voice=is_voice)
+        count_request(chat_id)
+        return
 
     if intent == "youtube":
         # Ссылка всегда отправляется отдельным текстовым сообщением,
