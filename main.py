@@ -1,5 +1,9 @@
 import os
 import sys
+import hmac
+import hashlib
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import time
 import uuid
@@ -13,7 +17,7 @@ import tempfile
 import wave
 import urllib.request
 import urllib.error
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote, parse_qs, urlparse
 from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageOps
 
@@ -55,13 +59,21 @@ teratts_model = None
 teratts_loading = False
 teratts_failed = False
 
-CHANNEL = "@VORTEX_RELAX"
+CHANNEL = "@VORTEX_RELAX"  # Оставлено только для обратной совместимости; подписка на канал больше не требуется.
+OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 
-FREE_REQUESTS = 5
-TRIAL_DAYS = 7
+FREE_REQUESTS = 15
 
-STARS_PRICE = 65
+STARS_PRICE = 65  # Оставлено для совместимости со старыми платежами Telegram.
+RUB_PRICE = 99
 PREMIUM_DAYS = 30
+YOOMONEY_WALLET = os.environ.get("YOOMONEY_WALLET", "4100119557351361").strip()
+YOOMONEY_SECRET = os.environ.get("YOOMONEY_SECRET", "").strip()
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+PORT = int(os.environ.get("PORT", "8080"))
+ORDERS_FILE = os.path.join(DATA_DIR, "yoomoney_orders.json") if "DATA_DIR" in globals() else "/app/data/yoomoney_orders.json"
+yoomoney_orders = {}
+yoomoney_orders_lock = threading.Lock()
 
 VOICE_MAX_TOKENS = 180
 TEXT_MAX_TOKENS = 1200
@@ -83,6 +95,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memories.json")
+ORDERS_FILE = os.path.join(DATA_DIR, "yoomoney_orders.json")
 LAST_IMAGES_DIR = os.path.join(DATA_DIR, "last_images")
 os.makedirs(LAST_IMAGES_DIR, exist_ok=True)
 
@@ -818,76 +831,214 @@ def is_subscribed(chat_id):
 
 
 def subscription_message(chat_id):
-    menu = {
-        "inline_keyboard": [
-            [{
-                "text": "📢 Подписаться на канал",
-                "url": "https://t.me/VORTEX_RELAX"
-            }],
-            [{
-                "text": "✅ Проверить подписку",
-                "callback_data": "check_subscription"
-            }]
-        ]
-    }
-
-    send_message(
-        chat_id,
-        "⚡ VORTEX\n\n"
-        "Твои 5 бесплатных запросов закончились!\n\n"
-        "Подпишись на наш канал, чтобы получить "
-        "7 дней бесплатного доступа.",
-        menu
-    )
+    # Старый вызов оставлен совместимым, но канал больше не используется.
+    payment_message(chat_id)
 
 
 # =========================
 # TELEGRAM STARS
 # =========================
 
+def load_yoomoney_orders():
+    global yoomoney_orders
+    yoomoney_orders = load_json(ORDERS_FILE, {})
+
+
+def save_yoomoney_orders():
+    save_json(ORDERS_FILE, yoomoney_orders)
+
+
+def create_yoomoney_order(chat_id):
+    token = uuid.uuid4().hex[:20]
+    label = f"vortex_{chat_id}_{token}"
+    with yoomoney_orders_lock:
+        yoomoney_orders[label] = {
+            "chat_id": str(chat_id),
+            "amount": f"{RUB_PRICE:.2f}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending"
+        }
+        save_yoomoney_orders()
+    return token, label
+
+
 def payment_message(chat_id):
-    payload = f"vortex_premium_30:{chat_id}:{uuid.uuid4().hex}"
-
-    prices = [{
-        "label": "VORTEX PREMIUM на 30 дней",
-        "amount": STARS_PRICE
-    }]
-
-    data = {
-        "chat_id": chat_id,
-        "title": "VORTEX PREMIUM",
-        "description": (
-            "30 дней полного доступа к VORTEX: "
-            "ИИ, создание постов, идеи, голосовые "
-            "и генерация изображений."
-        ),
-        "payload": payload,
-        "currency": "XTR",
-        "prices": json.dumps(prices, ensure_ascii=False)
-    }
-
-    try:
-        result = tg_request("sendInvoice", data)
-
-        if not result.get("ok"):
-            print("Invoice error:", result)
-            send_message(
-                chat_id,
-                "❌ Не удалось выставить счёт.\n"
-                "Попробуй немного позже.",
-                keyboard
-            )
-            return
-
-        print("Invoice sent:", chat_id, payload)
-
-    except Exception as error:
-        print("Invoice sending error:", error)
+    if not PUBLIC_BASE_URL:
         send_message(
             chat_id,
-            "❌ Ошибка при создании счёта. Попробуй позже.",
-            keyboard
+            "⚙️ Оплата ЮMoney ещё настраивается.\n"
+            "Владелец должен добавить PUBLIC_BASE_URL в Railway после создания публичного домена."
         )
+        return
+
+    token, label = create_yoomoney_order(chat_id)
+    payment_url = f"{PUBLIC_BASE_URL}/pay/{token}"
+    menu = {"inline_keyboard": [[{"text": f"💳 Оплатить {RUB_PRICE} ₽", "url": payment_url}]]}
+    send_message(
+        chat_id,
+        f"💎 VORTEX PREMIUM\n\n"
+        f"Стоимость: {RUB_PRICE} ₽\n"
+        f"Срок: {PREMIUM_DAYS} дней\n\n"
+        "Нажми кнопку ниже, чтобы перейти к безопасной оплате ЮMoney. "
+        "Premium включится автоматически после подтверждения платежа.",
+        menu
+    )
+
+
+def yoomoney_signature(params):
+    secret = YOOMONEY_SECRET.encode("utf-8")
+    # ЮMoney требует сортировку параметров и RFC 3986 URL-кодирование значений.
+    parts = []
+    for key in sorted(k for k in params if k != "sign"):
+        value = str(params[key])
+        parts.append(f"{quote(str(key), safe='~')}={quote(value, safe='~')}")
+    message = "&".join(parts).encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+
+def activate_yoomoney_order(params):
+    if not YOOMONEY_SECRET:
+        raise ValueError("YOOMONEY_SECRET is not configured")
+
+    received_sign = str(params.get("sign", ""))
+    expected_sign = yoomoney_signature(params)
+    if not received_sign or not hmac.compare_digest(received_sign.lower(), expected_sign.lower()):
+        raise ValueError("Invalid YooMoney notification signature")
+
+    if params.get("notification_type") not in ("p2p-incoming", "card-incoming"):
+        raise ValueError("Unsupported notification type")
+    if params.get("currency") != "643" or params.get("unaccepted", "false").lower() == "true":
+        raise ValueError("Invalid currency or unaccepted payment")
+
+    label = str(params.get("label", ""))
+    operation_id = str(params.get("operation_id", ""))
+    if not label or not operation_id:
+        raise ValueError("Missing payment label or operation_id")
+
+    # Для quickpay amount — сумма, зачисленная кошельку после комиссии;
+    # withdraw_amount — сумма, списанная с плательщика. Сверяем именно её.
+    try:
+        paid_amount = round(float(params.get("withdraw_amount", "0")), 2)
+    except (TypeError, ValueError):
+        raise ValueError("Invalid payment amount")
+    if paid_amount != float(RUB_PRICE):
+        raise ValueError(f"Unexpected payment amount: {paid_amount}")
+
+    with yoomoney_orders_lock:
+        order = yoomoney_orders.get(label)
+        if not order:
+            raise ValueError("Unknown payment label")
+        if order.get("status") == "paid":
+            return None, True
+        if round(float(order.get("amount", 0)), 2) != paid_amount:
+            raise ValueError("Order amount mismatch")
+
+        # Помечаем операцию до отправки сообщения, чтобы повторный callback
+        # ЮMoney не продлил Premium второй раз.
+        used_ops = order.setdefault("operation_ids", [])
+        if operation_id in used_ops:
+            return None, True
+        order["status"] = "paid"
+        order["operation_ids"] = (used_ops + [operation_id])[-20:]
+        order["paid_at"] = datetime.now(timezone.utc).isoformat()
+        save_yoomoney_orders()
+        chat_id = int(order["chat_id"])
+
+    user = get_user(chat_id)
+    charges = user.get("payment_charges", [])
+    unique_charge = f"yoomoney:{operation_id}"
+    if unique_charge in charges:
+        return None, True
+
+    now = datetime.now(timezone.utc)
+    old_paid_until = parse_date(user.get("paid_until"))
+    start = old_paid_until if old_paid_until and old_paid_until > now else now
+    end = start + timedelta(days=PREMIUM_DAYS)
+    user["paid_until"] = end.isoformat()
+    charges.append(unique_charge)
+    user["payment_charges"] = charges[-100:]
+    save_users()
+    print("YooMoney Premium activated:", chat_id, "until:", end.isoformat(), "operation:", operation_id)
+    return (chat_id, end), False
+
+
+def start_yoomoney_http_server():
+    class YooMoneyHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            print("[YOOMONEY HTTP]", fmt % args)
+
+        def _reply(self, status, content_type, body):
+            data = body.encode("utf-8") if isinstance(body, str) else body
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/health":
+                return self._reply(200, "text/plain; charset=utf-8", "VORTEX OK")
+            if path.startswith("/pay/"):
+                token = path.rsplit("/", 1)[-1]
+                with yoomoney_orders_lock:
+                    match = next((
+                        (label, order) for label, order in yoomoney_orders.items()
+                        if label.endswith("_" + token) and order.get("status") == "pending"
+                    ), None)
+                if not match:
+                    return self._reply(404, "text/plain; charset=utf-8", "Ссылка оплаты недействительна или уже использована.")
+                label, order = match
+                form = (
+                    '<!doctype html><html lang="ru"><meta charset="utf-8">'
+                    '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                    '<title>Оплата VORTEX PREMIUM</title>'
+                    '<body style="font:16px Arial;max-width:420px;margin:40px auto;padding:20px">'
+                    '<h2>VORTEX PREMIUM</h2><p>К оплате: 99 ₽ за 30 дней</p>'
+                    '<form id="pay" method="POST" action="https://yoomoney.ru/quickpay/confirm">'
+                    f'<input type="hidden" name="receiver" value="{YOOMONEY_WALLET}">'
+                    f'<input type="hidden" name="label" value="{label}">'
+                    '<input type="hidden" name="quickpay-form" value="button">'
+                    '<input type="hidden" name="sum" value="99.00">'
+                    '<input type="hidden" name="paymentType" value="AC">'
+                    '<button type="submit" style="padding:14px 22px;font-size:17px">Перейти к оплате</button>'
+                    '</form><script>document.getElementById("pay").submit();</script>'
+                    '</body></html>'
+                )
+                return self._reply(200, "text/html; charset=utf-8", form)
+            return self._reply(404, "text/plain; charset=utf-8", "Not found")
+
+        def do_POST(self):
+            if urlparse(self.path).path != "/yoomoney/webhook":
+                return self._reply(404, "text/plain; charset=utf-8", "Not found")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 65536:
+                    return self._reply(400, "text/plain; charset=utf-8", "Bad request")
+                raw = self.rfile.read(length).decode("utf-8")
+                parsed = parse_qs(raw, keep_blank_values=True)
+                params = {key: values[-1] for key, values in parsed.items()}
+                activated, duplicate = activate_yoomoney_order(params)
+                if activated:
+                    chat_id, paid_until = activated
+                    send_message(
+                        chat_id,
+                        "🎉 Оплата ЮMoney получена!\n\n"
+                        "💎 VORTEX PREMIUM активирован на 30 дней.\n"
+                        f"Доступ до: {paid_until.strftime('%d.%m.%Y %H:%M')} UTC.",
+                        keyboard
+                    )
+                return self._reply(200, "text/plain; charset=utf-8", "OK")
+            except Exception as error:
+                print("[YOOMONEY WEBHOOK ERROR]", repr(error))
+                return self._reply(400, "text/plain; charset=utf-8", "Invalid notification")
+
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), YooMoneyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[YOOMONEY] HTTP server listening on 0.0.0.0:{PORT}")
+    print("[YOOMONEY] Webhook path: /yoomoney/webhook")
+    return server
 
 
 def handle_pre_checkout(query):
@@ -1012,60 +1163,54 @@ def activate_premium(message):
 # ПРОВЕРКА ДОСТУПА
 # =========================
 
+def is_owner(chat_id):
+    return bool(OWNER_ID) and str(chat_id) == OWNER_ID
+
+
 def check_access(chat_id):
+    if is_owner(chat_id):
+        return "owner"
+
     user = get_user(chat_id)
-
     paid_until = parse_date(user.get("paid_until"))
-    trial_until = parse_date(user.get("trial_until"))
-
     now = datetime.now(timezone.utc)
 
     if paid_until and now < paid_until:
         return "paid"
 
-    if trial_until:
-        if now < trial_until:
-            if is_subscribed(chat_id):
-                return "trial"
-
-            return "channel"
-
-        return "expired"
-
-    if user["requests"] < FREE_REQUESTS:
+    if user.get("requests", 0) < FREE_REQUESTS:
         return "free"
 
-    return "channel"
+    return "expired"
 
 
 def can_use_ai(chat_id):
     access = check_access(chat_id)
 
-    if access in ["free", "trial", "paid"]:
+    if access in ["owner", "free", "paid"]:
         return True
 
-    if access == "channel":
-        subscription_message(chat_id)
-        return False
-
-    if access == "expired":
-        send_message(
-            chat_id,
-            "⏳ Твой доступ закончился.\n\n"
-            "Оформи VORTEX PREMIUM, чтобы продолжить.",
-            keyboard
-        )
-        payment_message(chat_id)
-        return False
-
+    send_message(
+        chat_id,
+        "⏳ Твои 15 бесплатных запросов закончились.\n\n"
+        "Чтобы продолжить пользоваться VORTEX, оформи Premium на 30 дней.",
+        keyboard
+    )
+    payment_message(chat_id)
     return False
 
 
 def count_request(chat_id):
-    user = get_user(chat_id)
+    if is_owner(chat_id):
+        return
 
-    if not user.get("trial_until") and not user.get("paid_until"):
-        user["requests"] += 1
+    user = get_user(chat_id)
+    paid_until = parse_date(user.get("paid_until"))
+    now = datetime.now(timezone.utc)
+
+    # Считаем только бесплатные запросы. Платный доступ не расходует лимит.
+    if not paid_until or now >= paid_until:
+        user["requests"] = min(FREE_REQUESTS, user.get("requests", 0) + 1)
         save_users()
 
 
@@ -2100,6 +2245,7 @@ def handle_callback(callback):
     if callback_data != "check_subscription":
         return
 
+    # Старые кнопки проверки канала больше не выдают пробный доступ.
     if not is_subscribed(chat_id):
         send_message(
             chat_id,
@@ -2108,29 +2254,12 @@ def handle_callback(callback):
         )
         return
 
-    user = get_user(chat_id)
-
-    if not user.get("trial_until"):
-        start = datetime.now(timezone.utc)
-        end = start + timedelta(days=TRIAL_DAYS)
-
-        user["trial_until"] = end.isoformat()
-        save_users()
-
-        send_message(
-            chat_id,
-            "🎉 Подписка подтверждена!\n\n"
-            "Тебе начислено 7 дней бесплатного доступа.\n"
-            "Приятного пользования VORTEX!",
-            keyboard
-        )
-    else:
-        send_message(
-            chat_id,
-            "✅ Подписка подтверждена!\n"
-            "Можешь продолжать пользоваться VORTEX.",
-            keyboard
-        )
+    send_message(
+        chat_id,
+        "Подписка на канал больше не нужна. Для продолжения оформи Premium.",
+        keyboard
+    )
+    payment_message(chat_id)
 
 
 # =========================
@@ -2702,7 +2831,7 @@ def handle_message(message):
             "Обычный разговор и вопросы голосом → отвечаю голосом.\n"
             "Погода голосом → отвечаю голосом.\n"
             "Ссылки, посты, идеи, презентации и файлы → отправляю текстом или готовым файлом, без озвучки.\n\n"
-            "Команды: /profile, /buy, /terms, /paysupport, /cancel\n\n"
+            "Бесплатно: 15 запросов. Затем Premium на 30 дней.\n\nКоманды: /profile, /buy, /terms, /paysupport, /cancel\n\n"
             "VORTEX. Твои идеи. Мои возможности. ⚡"
         )
         return
@@ -2711,7 +2840,7 @@ def handle_message(message):
         send_message(chat_id,
             "📄 Условия VORTEX PREMIUM\n\n"
             "1. Premium предоставляет доступ к функциям VORTEX на 30 дней.\n"
-            "2. Стоимость: 65 Telegram Stars.\n"
+            f"2. Стоимость: {RUB_PRICE} ₽ за 30 дней.\n"
             "3. Доступ активируется после подтверждения успешного платежа Telegram.\n"
             "4. Подписка не продлевается автоматически.\n"
             "5. Для продления необходимо совершить новый платёж.\n"
@@ -2738,7 +2867,9 @@ def handle_message(message):
     if command in ("/profile", "/me"):
         user = get_user(chat_id)
         access = check_access(chat_id)
-        if access == "free":
+        if access == "owner":
+            status = "Статус: 👑 Владелец VORTEX, безлимитный бесплатный доступ"
+        elif access == "free":
             status = f"Бесплатные запросы: {user['requests']}/{FREE_REQUESTS}"
         elif access == "trial":
             trial_end = parse_date(user.get("trial_until"))
@@ -2749,10 +2880,10 @@ def handle_message(message):
         elif access == "expired":
             status = "Статус: доступ закончился"
         else:
-            status = "Статус: требуется подписка на канал"
+            status = "Статус: бесплатный лимит закончился, требуется Premium"
         send_message(chat_id,
             f"👤 Твой профиль\nID: {chat_id}\n\n{status}\n\n"
-            f"💎 Premium: {STARS_PRICE} Stars / 30 дней")
+            f"💎 Premium: {RUB_PRICE} ₽ / 30 дней")
         return
 
     # Совместимость со старыми текстовыми командами меню.
@@ -2925,9 +3056,13 @@ def main():
     load_users()
     load_memories()
     load_battleship_games()
+    load_yoomoney_orders()
+    start_yoomoney_http_server()
 
     print("VORTEX запускается...")
     print("Persistent storage directory:", DATA_DIR)
+    print("YooMoney secret configured:", bool(YOOMONEY_SECRET))
+    print("Public payment URL configured:", bool(PUBLIC_BASE_URL))
     print("Users file:", USERS_FILE, "exists:", os.path.exists(USERS_FILE))
     print("History file:", HISTORY_FILE, "exists:", os.path.exists(HISTORY_FILE))
     print("Memory file:", MEMORY_FILE, "exists:", os.path.exists(MEMORY_FILE))
