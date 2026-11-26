@@ -1668,8 +1668,11 @@ def analyze_video_note(file_id, user_request=""):
         }
         req = urllib.request.Request(
             GROQ_API, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {GROQ_KEY}"}
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "User-Agent": "VORTEX-Bot/1.0"
+            }
         )
         try:
             with urllib.request.urlopen(req, timeout=150) as response:
