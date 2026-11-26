@@ -248,25 +248,83 @@ def send_voice(chat_id, audio_data, caption=""):
 
 
 def download_telegram_file(file_id):
+    """Скачивает файл Telegram с безопасной диагностикой и повторами временных ошибок."""
     started = time.perf_counter()
 
-    info = tg_request("getFile", {"file_id": file_id})
+    try:
+        info = tg_request("getFile", {"file_id": file_id})
+    except urllib.error.HTTPError as error:
+        details = error.read(1000).decode("utf-8", errors="replace")
+        print(f"[VIDEO DOWNLOAD] getFile HTTP {error.code}: {details[:500]}")
+        raise RuntimeError(f"Telegram getFile вернул HTTP {error.code}") from error
+    except Exception as error:
+        print("[VIDEO DOWNLOAD] getFile request failed:", repr(error))
+        raise
 
     if not info.get("ok"):
-        raise Exception("Telegram не смог получить файл")
+        print("[VIDEO DOWNLOAD] getFile API error:", str(info)[:500])
+        raise RuntimeError("Telegram getFile вернул ok=false")
 
-    file_path = info["result"]["file_path"]
+    result = info.get("result") or {}
+    file_path = result.get("file_path")
+    file_size = result.get("file_size")
+    if not file_path:
+        raise RuntimeError("Telegram getFile не вернул file_path")
+
+    # Облачный Bot API ограничивает скачивание файлов размером 20 МБ.
+    max_size = 20 * 1024 * 1024
+    if file_size is not None and int(file_size) > max_size:
+        raise RuntimeError(
+            f"Видеокружок слишком большой: {int(file_size)} байт, лимит облачного Bot API 20 МБ"
+        )
+
     url = TG_FILE_API + file_path
+    last_error = None
+    for attempt in range(1, 4):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "VORTEX-Bot/1.0",
+                "Connection": "close"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                file_data = response.read(max_size + 1)
+                content_type = response.headers.get("Content-Type", "unknown")
 
-    with urllib.request.urlopen(url, timeout=60) as response:
-        file_data = response.read()
+            if not file_data:
+                raise RuntimeError("Telegram вернул пустой файл")
+            if len(file_data) > max_size:
+                raise RuntimeError("Видеокружок превышает лимит скачивания 20 МБ")
 
-    print(
-        f"[SPEED] Telegram download: "
-        f"{time.perf_counter() - started:.2f} sec"
-    )
+            print(
+                f"[SPEED] Telegram download: {time.perf_counter() - started:.2f} sec; "
+                f"bytes={len(file_data)}; content_type={content_type}; attempt={attempt}"
+            )
+            return file_data
 
-    return file_data
+        except urllib.error.HTTPError as error:
+            details = error.read(1000).decode("utf-8", errors="replace")
+            print(
+                f"[VIDEO DOWNLOAD] file download HTTP {error.code}; "
+                f"attempt={attempt}; response={details[:500]}"
+            )
+            last_error = error
+            # 403 обычно не является временной ошибкой. Не повторяем его вслепую.
+            if error.code not in (429, 500, 502, 503, 504) or attempt == 3:
+                raise RuntimeError(
+                    f"Telegram file download вернул HTTP {error.code}: {details[:300]}"
+                ) from error
+        except (TimeoutError, OSError, urllib.error.URLError) as error:
+            print(f"[VIDEO DOWNLOAD] network error attempt={attempt}: {repr(error)}")
+            last_error = error
+            if attempt == 3:
+                raise RuntimeError("Сетевая ошибка при скачивании видеокружка") from error
+
+        time.sleep(attempt * 1.5)
+
+    raise RuntimeError("Не удалось скачать видеокружок") from last_error
 
 
 # =========================
@@ -1612,21 +1670,38 @@ def handle_video_note(message):
         return
     try:
         note = message.get("video_note") or {}
-        answer, spoken_text = analyze_video_note(note.get("file_id"), message.get("caption", ""))
+        try:
+            answer, spoken_text = analyze_video_note(
+                note.get("file_id"), message.get("caption", "")
+            )
+        except Exception as error:
+            print("[VIDEO NOTE] analysis/download failed:", repr(error))
+            raise
+
         if spoken_text:
             last_video_transcripts[chat_id] = spoken_text
         count_request(chat_id)
 
-        audio_data = text_to_speech(answer)
-        if not audio_data:
-            raise Exception("TTS не вернул аудиофайл")
-        send_voice(chat_id, audio_data)
+        try:
+            audio_data = text_to_speech(answer)
+            if not audio_data:
+                raise RuntimeError("TTS не вернул аудиофайл")
+        except Exception as error:
+            print("[VIDEO NOTE] voice generation failed:", repr(error))
+            raise
+
+        try:
+            send_voice(chat_id, audio_data)
+        except Exception as error:
+            print("[VIDEO NOTE] Telegram sendVoice failed:", repr(error))
+            raise
+
     except Exception as error:
         print("Video note handler error:", repr(error))
         send_message(
             chat_id,
-            "Сэр, не удалось обработать кружок или создать голосовой ответ. "
-            "Попробуйте ещё раз. Учтите, что у Telegram Bot API есть ограничения на размер скачиваемого файла."
+            "Сэр, не удалось обработать кружок или отправить голосовой ответ. "
+            "Попробуйте ещё раз. Если ошибка повторится, я смогу определить её по журналу Railway."
         )
 
 
