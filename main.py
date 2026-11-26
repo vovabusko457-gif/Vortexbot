@@ -70,6 +70,7 @@ user_states = {}
 chat_histories = {}
 users = {}
 last_video_transcripts = {}
+long_term_memories = {}
 
 # =========================
 # RAILWAY PERSISTENT STORAGE
@@ -80,6 +81,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+MEMORY_FILE = os.path.join(DATA_DIR, "memories.json")
 LAST_IMAGES_DIR = os.path.join(DATA_DIR, "last_images")
 os.makedirs(LAST_IMAGES_DIR, exist_ok=True)
 
@@ -649,6 +651,77 @@ def load_history():
     }
 
 
+def save_memories():
+    save_json(MEMORY_FILE, long_term_memories)
+
+
+def load_memories():
+    global long_term_memories
+    data = load_json(MEMORY_FILE, {})
+    long_term_memories = {str(key): value for key, value in data.items() if isinstance(value, dict)}
+
+
+def get_memory_summary(chat_id):
+    entry = long_term_memories.get(str(chat_id), {})
+    return str(entry.get("summary", "")).strip()
+
+
+def update_long_term_memory(chat_id, user_text, assistant_text):
+    """Раз в несколько обычных диалогов обновляет компактную долговременную память."""
+    key = str(chat_id)
+    entry = long_term_memories.setdefault(key, {"summary": "", "pending_turns": 0})
+    entry["pending_turns"] = int(entry.get("pending_turns", 0)) + 1
+
+    # Не вызываем дополнительную модель после каждого сообщения.
+    if entry["pending_turns"] < 4:
+        save_memories()
+        return
+
+    recent = chat_histories.get(chat_id, [])[-8:]
+    old_summary = str(entry.get("summary", "")).strip()
+    prompt = (
+        "Обнови краткую долговременную память о пользователе для будущих разговоров. "
+        "Сохраняй только полезные устойчивые факты, предпочтения, текущие проекты, цели и важный контекст. "
+        "Не сохраняй случайные мелочи, одноразовые вопросы, пароли, ключи, финансовые реквизиты или другие секреты. "
+        "Не делай выводов, которых пользователь прямо не сообщал. Если факт устарел или пользователь его исправил, "
+        "используй более новую информацию. Пиши по-русски, кратко, максимум 1200 символов. "
+        "Верни только обновлённую память обычным текстом, без вступления. Если сохранять нечего, верни пустую строку.\n\n"
+        f"Предыдущая память:\n{old_summary or 'Пока пусто.'}\n\n"
+        f"Последние сообщения диалога (JSON):\n{json.dumps(recent, ensure_ascii=False)}\n\n"
+        f"Последний обмен:\nПользователь: {user_text}\nVORTEX: {assistant_text}"
+    )
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": "Ты аккуратный редактор персональной памяти. Не выдумывай факты."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.1,
+        "max_completion_tokens": 500
+    }
+    req = urllib.request.Request(
+        GROQ_API,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_KEY}",
+            "User-Agent": "VORTEX-Bot/1.0"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read())
+        summary = clean_ai_text(result["choices"][0]["message"]["content"])[:1200]
+        entry["summary"] = summary
+        entry["pending_turns"] = 0
+        save_memories()
+        print(f"[MEMORY] Updated for chat {chat_id}; chars={len(summary)}")
+    except Exception as error:
+        # Оставляем pending_turns, чтобы повторить обновление при следующем диалоге.
+        print("[MEMORY] Update failed:", repr(error))
+        save_memories()
+
+
 def save_users():
     save_json(USERS_FILE, users)
 
@@ -1000,6 +1073,11 @@ def clean_ai_text(value):
 def ask_ai(chat_id, prompt, max_tokens=TEXT_MAX_TOKENS):
     history = chat_histories.get(chat_id, [])
 
+    memory_summary = get_memory_summary(chat_id)
+    memory_context = (
+        "\n\nДолговременная память о пользователе (используй только если это уместно):\n" + memory_summary
+        if memory_summary else ""
+    )
     messages = [
         {
             "role": "system",
@@ -1018,7 +1096,7 @@ def ask_ai(chat_id, prompt, max_tokens=TEXT_MAX_TOKENS):
                 "Для серьёзных вопросов сохраняй точность и отвечай по существу. Не выдумывай факты. "
                 "Выдавай чистый обычный текст без Markdown, хештегов и декоративного форматирования. "
                 "Если не знаешь ответа, честно скажи об этом."
-            )
+            ) + memory_context
         }
     ]
 
@@ -1580,7 +1658,7 @@ def transcribe_audio_bytes(audio_data, filename="circle.mp3", content_type="audi
     return result.get("text", "").strip()
 
 
-def analyze_video_note(file_id, user_request=""):
+def analyze_video_note(file_id, user_request="", chat_id=None):
     """Полностью извлекает аудио и анализирует видеокружок по кадрам по всей длительности."""
     video_data = download_telegram_file(file_id)
     # Облачный Telegram Bot API обычно ограничивает скачивание файлов ботом 20 МБ.
@@ -1652,6 +1730,11 @@ def analyze_video_note(file_id, user_request=""):
                 "url": "data:image/jpeg;base64," + encoded
             }})
 
+        memory_summary = get_memory_summary(chat_id) if chat_id is not None else ""
+        memory_context = (
+            "\n\nКонтекст из прошлых разговоров с пользователем (используй только если уместно):\n" + memory_summary
+            if memory_summary else ""
+        )
         payload = {
             "model": VISION_MODEL,
             "messages": [
@@ -1672,7 +1755,7 @@ def analyze_video_note(file_id, user_request=""):
                     "Не выдумывай бренды, цены, статус, события или детали, которых нельзя уверенно определить по кадрам и речи. "
                     "Если не уверен, скажи это прямо, но легко и без занудства. "
                     "Учитывай и изображение, и распознанную речь вместе. Не используй Markdown, хештеги или списки в голосовом ответе."
-                )},
+                ) + memory_context},
                 {"role": "user", "content": content}
             ],
             "temperature": 0.65,
@@ -1714,7 +1797,7 @@ def handle_video_note(message):
         note = message.get("video_note") or {}
         try:
             answer, spoken_text = analyze_video_note(
-                note.get("file_id"), message.get("caption", "")
+                note.get("file_id"), message.get("caption", ""), chat_id
             )
         except Exception as error:
             print("[VIDEO NOTE] analysis/download failed:", repr(error))
@@ -1722,6 +1805,8 @@ def handle_video_note(message):
 
         if spoken_text:
             last_video_transcripts[chat_id] = spoken_text
+        memory_user_text = "Пользователь отправил видеокружок. " + (spoken_text or message.get("caption", ""))
+        update_long_term_memory(chat_id, memory_user_text, answer)
         count_request(chat_id)
 
         try:
@@ -2309,6 +2394,7 @@ def handle_message(message):
     else:
         answer = ask_ai(chat_id, text, max_tokens=TEXT_MAX_TOKENS)
 
+    update_long_term_memory(chat_id, text, answer)
     count_request(chat_id)
 
     if is_voice:
@@ -2337,11 +2423,13 @@ def main():
 
     load_history()
     load_users()
+    load_memories()
 
     print("VORTEX запускается...")
     print("Persistent storage directory:", DATA_DIR)
     print("Users file:", USERS_FILE, "exists:", os.path.exists(USERS_FILE))
     print("History file:", HISTORY_FILE, "exists:", os.path.exists(HISTORY_FILE))
+    print("Memory file:", MEMORY_FILE, "exists:", os.path.exists(MEMORY_FILE))
 
     if CF_ACCOUNT_ID and CF_API_TOKEN:
         print("Cloudflare Image API настроен.")
