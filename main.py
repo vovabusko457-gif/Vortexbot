@@ -2291,9 +2291,166 @@ def build_presentation(chat_id, user_request):
     return output.getvalue()
 
 
+
+def _extract_json_objects(html, marker, limit=8):
+    """Извлекает небольшие JSON-объекты YouTube из встроенного HTML."""
+    found = []
+    pos = 0
+    while len(found) < limit:
+        start = html.find(marker, pos)
+        if start < 0:
+            break
+        start += len(marker)
+        while start < len(html) and html[start].isspace():
+            start += 1
+        if start >= len(html) or html[start] != '{':
+            pos = start + 1
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for end in range(start, len(html)):
+            char = html[end]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == '\\':
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            else:
+                if char == '"':
+                    in_string = True
+                elif char == '{':
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            found.append(json.loads(html[start:end + 1]))
+                        except Exception:
+                            pass
+                        pos = end + 1
+                        break
+        else:
+            break
+    return found
+
+
+def search_youtube(query, kind="video"):
+    """Ищет каналы, обычные видео или текущие эфиры YouTube."""
+    params = {"search_query": query}
+    if kind == "live":
+        # YouTube filter: live broadcasts only.
+        params["sp"] = "EgJAAQ=="
+    url = "https://www.youtube.com/results?" + urlencode(params)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=18) as response:
+            html = response.read().decode("utf-8", errors="ignore")
+    except Exception as error:
+        print("YouTube search error:", type(error).__name__, str(error)[:180])
+        return []
+
+    results = []
+    if kind == "channel":
+        objects = _extract_json_objects(html, '"channelRenderer":', 12)
+        for obj in objects:
+            title = obj.get("title", {}).get("simpleText") or ""
+            channel_id = obj.get("channelId") or ""
+            if title and channel_id:
+                results.append({"title": title, "url": "https://www.youtube.com/channel/" + channel_id, "kind": "channel"})
+    else:
+        objects = _extract_json_objects(html, '"videoRenderer":', 16)
+        for obj in objects:
+            video_id = obj.get("videoId") or ""
+            title_data = obj.get("title", {})
+            title = title_data.get("runs", [{}])[0].get("text", "") if title_data.get("runs") else title_data.get("simpleText", "")
+            owner = obj.get("ownerText", {}).get("runs", [{}])[0].get("text", "") if obj.get("ownerText", {}).get("runs") else ""
+            badges = " ".join(
+                str(x.get("metadataBadgeRenderer", {}).get("label", ""))
+                for x in obj.get("badges", [])
+            )
+            overlays = json.dumps(obj.get("thumbnailOverlays", []), ensure_ascii=False).lower()
+            metadata = json.dumps(obj.get("upcomingEventData", {}), ensure_ascii=False).lower()
+            is_live = any(mark in (badges + " " + overlays + " " + metadata).lower()
+                          for mark in ("live", "прямой эфир", "в эфире", "live now"))
+            if video_id and title:
+                results.append({"title": title, "url": "https://www.youtube.com/watch?v=" + video_id,
+                                "owner": owner, "kind": "live" if is_live else "video", "is_live": is_live})
+
+    if kind == "live":
+        # Приоритет только у помеченных YouTube как прямой эфир.
+        results = [item for item in results if item.get("is_live")]
+    unique = []
+    seen = set()
+    for item in results:
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            unique.append(item)
+    return unique[:5]
+
+
+def handle_youtube_search(chat_id, text):
+    value = text.lower().replace("ё", "е")
+    channel_words = ("канал", "ютубер", "блогер", "блогера", "ютуб канал")
+    live_words = ("прямую трансляцию", "прямая трансляция", "прямой эфир", "трансляцию", "трансляция", "стрим", "стрима", "стримы", "live")
+    if any(word in value for word in live_words):
+        kind = "live"
+    elif any(word in value for word in channel_words):
+        kind = "channel"
+    else:
+        kind = "video"
+
+    query = re.sub(
+        r"(?i)\b(?:вортекс|дай|дайте|ссылку|ссылка|найди|найти|поищи|поиск|покажи|мне|найди|на\s+ютубе|в\s+ютубе|на\s+youtube|в\s+youtube|ютуб|youtube|канал|каналы|ютубер\w*|блогер\w*|видео|ролик|ролики|стрим|стримы|прямую|прямая|прямой|трансляцию|трансляция|эфир|live)\b",
+        " ", text
+    )
+    query = re.sub(r"\s+", " ", query).strip(" ,.!?:;-")
+    if not query:
+        send_message(chat_id, "Сэр, что именно ищем? Название канала, автора, видео или футбольный матч.")
+        return
+
+    label = "прямой эфир" if kind == "live" else ("канал" if kind == "channel" else "видео")
+    send_message(chat_id, f"🔎 Ищу {label} на YouTube: {query}")
+    results = search_youtube(query, kind)
+    if not results:
+        params = {"search_query": query}
+        if kind == "live":
+            params["sp"] = "EgJAAQ=="
+        search_url = "https://www.youtube.com/results?" + urlencode(params)
+        if kind == "live":
+            send_message(chat_id,
+                "Пока не нашёл подтверждённый активный эфир на YouTube. Вот поиск прямых трансляций по этому матчу:\n" + search_url +
+                "\n\nЕсли матч сейчас идёт, проверь также официального вещателя в своей стране. Я не буду выдавать пиратские или непроверенные ссылки за официальный эфир.")
+        else:
+            send_message(chat_id, "YouTube не отдал список результатов. Вот прямой поиск:\n" + search_url)
+        return
+
+    if kind == "channel":
+        lines = ["📡 Нашёл каналы на YouTube, сэр:"]
+    elif kind == "live":
+        lines = ["🔴 Нашёл эфиры, которые YouTube помечает как прямые:"]
+    else:
+        lines = ["📺 Нашёл видео на YouTube, сэр:"]
+    for index, item in enumerate(results, 1):
+        extra = ("\nКанал: " + item["owner"]) if item.get("owner") else ""
+        lines.append(f"\n{index}. {item['title']}{extra}\n{item['url']}")
+    if kind == "live":
+        lines.append("\nПроверь, что эфир официальный и доступен в твоём регионе.")
+    send_message(chat_id, "\n".join(lines))
+
 def detect_intent(text):
     """Распознаёт намерение пользователя по обычной русской формулировке."""
     value = text.lower().strip().replace("ё", "е")
+
+    youtube_action = re.search(r"\b(?:найди|найти|поищи|поиск|покажи|включи|дай|дайте)\b", value)
+    youtube_subject = re.search(r"\b(?:youtube|ютуб|канал\w*|ютубер\w*|блогер\w*|видео|ролик\w*|стрим\w*|трансляц\w*|эфир)\b", value)
+    if youtube_action and youtube_subject:
+        return "youtube"
 
     presentation_patterns = (
         r"\b(?:презентац\w*|слайд\w*)\b",
@@ -2406,8 +2563,8 @@ def handle_message(message):
             "⚡ VORTEX на связи.\n\n"
             "Просто напиши, что нужно сделать, или отправь голосовое.\n\n"
             "Я могу создать пост, придумать идеи, ответить на вопрос, "
-            "сгенерировать изображение, отредактировать фото, создать презентацию PowerPoint "
-            "или проанализировать и перевести видеокружок.\n\n"
+            "сгенерировать изображение, отредактировать фото, создать презентацию PowerPoint, "
+            "найти каналы и видео на YouTube или проанализировать видеокружок.\n\n"
             "Голосовое сообщение → голосовой ответ.\n"
             "Текст → текстовый ответ.\n\n"
             "Команды: /profile, /buy, /terms, /paysupport, /cancel\n\n"
@@ -2476,7 +2633,7 @@ def handle_message(message):
         return
     if text == "✨ Возможности":
         send_message(chat_id,
-            "Я умею создавать посты, придумывать идеи, отвечать на вопросы, "
+            "Я умею создавать посты, придумывать идеи, отвечать на вопросы, искать каналы и видео на YouTube, "
             "генерировать изображения, редактировать фотографии и создавать презентации PowerPoint. "
             "Просто напиши задачу обычными словами.")
         return
@@ -2492,7 +2649,13 @@ def handle_message(message):
     if not can_use_ai(chat_id):
         return
 
-    intent = "chat" if is_voice else detect_intent(text)
+    detected_intent = detect_intent(text)
+    intent = detected_intent if (not is_voice or detected_intent == "youtube") else "chat"
+
+    if intent == "youtube":
+        handle_youtube_search(chat_id, text)
+        count_request(chat_id)
+        return
 
     if intent == "presentation":
         send_message(chat_id, "Понял. Собираю презентацию: готовлю содержание, иллюстрации и оформляю слайды. Это может занять несколько минут.")
