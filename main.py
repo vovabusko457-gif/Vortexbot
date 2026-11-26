@@ -2517,24 +2517,53 @@ def get_live_weather(city):
     return "\n".join(lines)
 
 
+def _weather_speech_text(answer):
+    """Короткий разговорный вариант погоды для озвучки, без источников и служебных строк."""
+    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    location_line = next((line for line in lines if line.startswith("🌤")), "")
+    location = re.sub(r"^🌤\s*Погода сейчас,\s*сэр:\s*", "", location_line).strip()
+    lines = [line for line in lines if "Open-Meteo" not in line and not line.startswith("🌤")]
+    spoken = (("Сейчас в " + location + ". ") if location else "") + " ".join(lines)
+    spoken = spoken.replace("Ощущается как:", "По ощущениям:")
+    spoken = spoken.replace("Сегодня:", "На сегодня прогноз:")
+    spoken = spoken.replace("Вероятность осадков сегодня:", "Вероятность осадков:")
+    spoken = spoken.replace("Ветер:", "Ветер:").replace("Влажность:", "Влажность:")
+    spoken = spoken.replace("°C", " градуса").replace("%.", " процентов.")
+    spoken = spoken.replace("км/ч", "километров в час")
+    spoken = re.sub(r"(?<!\d)(\d+)\.(\d+)", r"\1,\2", spoken)
+    return spoken
+
+
 def handle_weather_request(chat_id, text, is_voice=False):
     city = _weather_city_from_text(text)
     if not city:
-        send_message(chat_id, "Сэр, назовите город. Например: «Какая сейчас погода в Краснодаре?»")
+        answer = "Сэр, назовите город. Например: какая сейчас погода в Краснодаре?"
+        if is_voice:
+            audio = text_to_speech(answer)
+            if audio: send_voice(chat_id, audio)
+        else:
+            send_message(chat_id, answer)
         return
-    send_message(chat_id, f"🌐 Проверяю текущую погоду в {city}...")
+    if not is_voice:
+        send_message(chat_id, f"🌐 Проверяю текущую погоду в {city}...")
     try:
         answer = get_live_weather(city)
     except Exception as error:
         print("[WEATHER] Live lookup failed:", repr(error))
         answer = (f"Сэр, сейчас не удалось получить свежую погоду для {city}. "
                   "Похоже, внешний погодный сервис временно недоступен. Попробуйте чуть позже.")
-    send_message(chat_id, answer)
     if is_voice:
-        audio = text_to_speech(re.sub(r"https?://\S+", "", answer))
+        audio = text_to_speech(_weather_speech_text(answer))
         if audio:
-            try: send_voice(chat_id, audio)
-            except Exception as error: print("[WEATHER] Voice reply failed:", repr(error))
+            try:
+                send_voice(chat_id, audio)
+            except Exception as error:
+                print("[WEATHER] Voice reply failed:", repr(error))
+                send_message(chat_id, "Не получилось отправить голосовой ответ о погоде.")
+        else:
+            send_message(chat_id, "Не получилось создать голосовой ответ о погоде.")
+    else:
+        send_message(chat_id, answer)
 
 
 def detect_intent(text):
@@ -2670,8 +2699,9 @@ def handle_message(message):
             "Я могу создать пост, придумать идеи, ответить на вопрос, "
             "сгенерировать изображение, отредактировать фото, создать презентацию PowerPoint, "
             "найти каналы и видео на YouTube или проанализировать видеокружок.\n\n"
-            "Голосовое сообщение → голосовой ответ.\n"
-            "Текст → текстовый ответ.\n\n"
+            "Обычный разговор и вопросы голосом → отвечаю голосом.\n"
+            "Погода голосом → отвечаю голосом.\n"
+            "Ссылки, посты, идеи, презентации и файлы → отправляю текстом или готовым файлом, без озвучки.\n\n"
             "Команды: /profile, /buy, /terms, /paysupport, /cancel\n\n"
             "VORTEX. Твои идеи. Мои возможности. ⚡"
         )
@@ -2754,8 +2784,10 @@ def handle_message(message):
     if not can_use_ai(chat_id):
         return
 
+    # Формат входа не должен менять тип результата: голосовая команда может
+    # запускать создание файла, поста, изображения или поиск ссылки.
     detected_intent = detect_intent(text)
-    intent = detected_intent if (not is_voice or detected_intent in ("youtube", "weather")) else "chat"
+    intent = detected_intent
 
     if intent == "weather":
         handle_weather_request(chat_id, text, is_voice=is_voice)
