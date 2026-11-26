@@ -1563,8 +1563,21 @@ def transcribe_audio_bytes(audio_data, filename="circle.mp3", content_type="audi
         headers={"Authorization": f"Bearer {GROQ_KEY}",
                  "Content-Type": f"multipart/form-data; boundary={boundary}"}
     )
-    with urllib.request.urlopen(req, timeout=120) as response:
-        result = json.loads(response.read())
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        details = error.read(1500).decode("utf-8", errors="replace")
+        print(
+            f"[VIDEO WHISPER] Groq HTTP {error.code}; "
+            f"response={details[:1000]}"
+        )
+        raise RuntimeError(
+            f"Groq Whisper вернул HTTP {error.code}: {details[:300]}"
+        ) from error
+    except (TimeoutError, OSError, urllib.error.URLError) as error:
+        print("[VIDEO WHISPER] Groq network error:", repr(error))
+        raise RuntimeError("Сетевая ошибка при распознавании аудио кружка") from error
     return result.get("text", "").strip()
 
 
@@ -1657,8 +1670,21 @@ def analyze_video_note(file_id, user_request=""):
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {GROQ_KEY}"}
         )
-        with urllib.request.urlopen(req, timeout=150) as response:
-            result = json.loads(response.read())
+        try:
+            with urllib.request.urlopen(req, timeout=150) as response:
+                result = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            details = error.read(1500).decode("utf-8", errors="replace")
+            print(
+                f"[VIDEO VISION] Groq HTTP {error.code}; "
+                f"model={VISION_MODEL}; response={details[:1000]}"
+            )
+            raise RuntimeError(
+                f"Groq Vision вернул HTTP {error.code}: {details[:300]}"
+            ) from error
+        except (TimeoutError, OSError, urllib.error.URLError) as error:
+            print("[VIDEO VISION] Groq network error:", repr(error))
+            raise RuntimeError("Сетевая ошибка при анализе кадров кружка") from error
         answer = result["choices"][0]["message"]["content"].strip()
         return answer, spoken_text
 
