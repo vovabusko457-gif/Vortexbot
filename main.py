@@ -774,7 +774,9 @@ def get_user(chat_id):
             "requests": 0,
             "trial_until": None,
             "paid_until": None,
-            "payment_charges": []
+            "payment_charges": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "total_requests": 0
         }
 
     user = users[key]
@@ -783,6 +785,9 @@ def get_user(chat_id):
     user.setdefault("trial_until", None)
     user.setdefault("paid_until", None)
     user.setdefault("payment_charges", [])
+    # Для старых аккаунтов дату регистрации задним числом не придумываем.
+    # Счётчик статистики начинает накапливаться после обновления бота.
+    user.setdefault("total_requests", 0)
 
     return user
 
@@ -1209,17 +1214,16 @@ def can_use_ai(chat_id):
 
 
 def count_request(chat_id):
-    if is_owner(chat_id):
-        return
-
     user = get_user(chat_id)
+    user["total_requests"] = int(user.get("total_requests", 0) or 0) + 1
+
     paid_until = parse_date(user.get("paid_until"))
     now = datetime.now(timezone.utc)
 
-    # Считаем только бесплатные запросы. Платный доступ не расходует лимит.
-    if not paid_until or now >= paid_until:
+    # Счётчик бесплатного лимита не меняем для владельца и Premium.
+    if not is_owner(chat_id) and (not paid_until or now >= paid_until):
         user["requests"] = min(FREE_REQUESTS, user.get("requests", 0) + 1)
-        save_users()
+    save_users()
 
 
 # =========================
@@ -2766,6 +2770,9 @@ def detect_intent(text):
 
 def handle_message(message):
     chat_id = message["chat"]["id"]
+    user_record = get_user(chat_id)
+    user_record["last_active"] = datetime.now(timezone.utc).isoformat()
+    save_users()
 
     if message.get("successful_payment"):
         activate_premium(message)
@@ -2800,6 +2807,40 @@ def handle_message(message):
 
     command = text.split()[0].split("@")[0].lower()
 
+    if command == "/stats":
+        sender_id = str(message.get("from", {}).get("id", ""))
+        if not OWNER_ID or sender_id != OWNER_ID:
+            send_message(chat_id, "⛔ Эта команда доступна только владельцу VORTEX.")
+            return
+
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(hours=24)
+        all_users = list(users.values())
+        active_24h = sum(1 for item in all_users
+                         if (parse_date(item.get("last_active")) or datetime.min.replace(tzinfo=timezone.utc)) >= since)
+        new_24h = sum(1 for item in all_users
+                      if (parse_date(item.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= since)
+        premium_now = sum(1 for item in all_users
+                          if (parse_date(item.get("paid_until")) or datetime.min.replace(tzinfo=timezone.utc)) > now)
+        requests_total = sum(int(item.get("total_requests", 0) or 0) for item in all_users)
+        payments_total = sum(len(item.get("payment_charges", []) or []) for item in all_users)
+        old_without_dates = sum(1 for item in all_users if not item.get("created_at"))
+
+        stats_text = (
+            "📊 СТАТИСТИКА VORTEX\n\n"
+            f"👥 Всего пользователей: {len(all_users)}\n"
+            f"🟢 Активны за 24 часа: {active_24h}\n"
+            f"🆕 Новых за 24 часа: {new_24h}\n"
+            f"💎 Активных Premium: {premium_now}\n"
+            f"🤖 Запросов после установки статистики: {requests_total}\n"
+            f"💳 Сохранённых успешных платежей: {payments_total}\n\n"
+            f"ℹ️ Старых аккаунтов без даты регистрации: {old_without_dates}\n"
+            "Старые пользователи включены в общее количество. Исторические даты и запросы, "
+            "которых нет в базе, задним числом не восстанавливаются."
+        )
+        send_message(chat_id, stats_text)
+        return
+
     # Перевод последнего кружка отдельной командой после его отправки.
     if (chat_id in last_video_transcripts and
             re.search(r"(?i)\b(?:переведи|перевод|translate)\b", text)):
@@ -2829,8 +2870,8 @@ def handle_message(message):
     if command == "/start":
         user_states.pop(chat_id, None)
         get_user(chat_id)
-        send_message(
-            chat_id,
+
+        welcome_text = (
             "⚡ VORTEX на связи.\n\n"
             "Просто напиши, что нужно сделать, или отправь голосовое.\n\n"
             "Я могу создать пост, придумать идеи, ответить на вопрос, "
@@ -2842,6 +2883,20 @@ def handle_message(message):
             "Бесплатно: 15 запросов. Затем Premium на 30 дней.\n\nКоманды: /profile, /buy, /terms, /paysupport, /cancel\n\n"
             "VORTEX. Твои идеи. Мои возможности. ⚡"
         )
+
+        # Приветственная картинка лежит рядом с main.py в Railway.
+        welcome_image_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "vortex_welcome.jpeg"
+        )
+
+        try:
+            with open(welcome_image_path, "rb") as image_file:
+                send_photo(chat_id, image_file.read(), welcome_text)
+        except Exception as error:
+            print("[START] Welcome photo error:", repr(error))
+            # Если файл не загрузился, бот всё равно отвечает обычным текстом.
+            send_message(chat_id, welcome_text)
         return
 
     if command == "/terms":
